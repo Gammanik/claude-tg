@@ -42,6 +42,8 @@ type Agent struct {
 	gh          *GitHubClient
 	owner, repo string
 	progress    *ProgressTracker // может быть nil
+	bot         *Bot             // для создания прогресс-трекеров суб-агентов
+	threadID    int
 }
 
 func NewAgent(cfg Config, owner, repo string) *Agent {
@@ -51,6 +53,12 @@ func NewAgent(cfg Config, owner, repo string) *Agent {
 
 func (a *Agent) WithProgress(pt *ProgressTracker) *Agent {
 	a.progress = pt
+	return a
+}
+
+func (a *Agent) WithBot(bot *Bot, threadID int) *Agent {
+	a.bot = bot
+	a.threadID = threadID
 	return a
 }
 
@@ -196,7 +204,11 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 			Owner: a.owner, Repo: a.repo, Branch: branch,
 			Steps: make(chan Step, 50),
 		}
-		sub := NewAgent(a.cfg, a.owner, a.repo)
+		sub := NewAgent(a.cfg, a.owner, a.repo).WithBot(a.bot, a.threadID)
+		if a.bot != nil {
+			subPT := NewProgressTracker(a.bot, act.Args["task"], a.owner, a.repo, a.threadID)
+			sub = sub.WithProgress(subPT)
+		}
 		go sub.Run(subTask)
 		var sb strings.Builder
 		for step := range subTask.Steps {
@@ -206,6 +218,58 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 			}
 		}
 		return "subagent: " + sb.String(), 0, "", false, ""
+
+	case "orchestrate":
+		taskLines := strings.Split(strings.TrimSpace(act.Args["tasks"]), "\n")
+		type orchResult struct {
+			idx    int
+			output string
+			errMsg string
+		}
+		results := make(chan orchResult, len(taskLines))
+		count := 0
+		for i, t := range taskLines {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			count++
+			go func(idx int, taskDesc string) {
+				subTask := &Task{
+					ID:          fmt.Sprintf("%s-orch-%d", task.ID, idx),
+					Description: taskDesc,
+					Owner:       a.owner, Repo: a.repo, Branch: branch,
+					Steps: make(chan Step, 50),
+				}
+				sub := NewAgent(a.cfg, a.owner, a.repo).WithBot(a.bot, a.threadID)
+				if a.bot != nil {
+					subPT := NewProgressTracker(a.bot, taskDesc, a.owner, a.repo, a.threadID)
+					sub = sub.WithProgress(subPT)
+				}
+				go sub.Run(subTask)
+				var sb strings.Builder
+				for step := range subTask.Steps {
+					task.Steps <- step
+					if step.Type == StepDone {
+						sb.WriteString(step.Content)
+					} else if step.Type == StepError {
+						results <- orchResult{idx: idx, errMsg: step.Content}
+						return
+					}
+				}
+				results <- orchResult{idx: idx, output: sb.String()}
+			}(i, t)
+		}
+		var parts []string
+		for i := 0; i < count; i++ {
+			r := <-results
+			if r.errMsg != "" {
+				parts = append(parts, fmt.Sprintf("agent %d error: %s", r.idx, r.errMsg))
+			} else {
+				parts = append(parts, fmt.Sprintf("agent %d: %s", r.idx, r.output))
+			}
+		}
+		return strings.Join(parts, "\n"), 0, "", false, ""
 
 	case "create_pr":
 		num, url, err := a.gh.CreatePR(branch, act.Args["title"], act.Args["body"])
@@ -292,13 +356,18 @@ func callClaude(key string, messages []msg) (string, error) {
 			rest = append(rest, m)
 		}
 	}
+	// system как массив с cache_control — кэширует большой system prompt между шагами ReAct цикла
+	systemBlocks := []map[string]any{
+		{"type": "text", "text": system, "cache_control": map[string]string{"type": "ephemeral"}},
+	}
 	body, _ := json.Marshal(map[string]any{
 		"model": "claude-sonnet-4-20250514", "max_tokens": 8192,
-		"system": system, "messages": rest,
+		"system": systemBlocks, "messages": rest,
 	})
 	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
@@ -453,6 +522,11 @@ query: "useUserData"
 <action>
 tool: "spawn_subagent"
 task: "Write Playwright test for TrackingScreen"
+</action>
+
+<action>
+tool: "orchestrate"
+tasks: "Write unit tests for AuthService\nWrite integration test for login flow\nUpdate API docs"
 </action>
 
 <action>

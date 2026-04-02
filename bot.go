@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,19 @@ func NewBot(cfg Config) *Bot {
 	return b
 }
 
+// extMessage — расширяет tgbotapi.Message полем message_thread_id,
+// которое отсутствует в go-telegram-bot-api v5.5.1
+type extMessage struct {
+	tgbotapi.Message
+	MessageThreadID int `json:"message_thread_id,omitempty"`
+}
+
+type extUpdate struct {
+	UpdateID      int                     `json:"update_id"`
+	Message       *extMessage             `json:"message,omitempty"`
+	CallbackQuery *tgbotapi.CallbackQuery `json:"callback_query,omitempty"`
+}
+
 func (b *Bot) Start() error {
 	api, err := tgbotapi.NewBotAPI(b.cfg.TelegramToken)
 	if err != nil {
@@ -50,25 +64,56 @@ func (b *Bot) Start() error {
 	log.Printf("✅ @%s online", api.Self.UserName)
 	go b.reminderLoop()
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	for update := range api.GetUpdatesChan(u) {
-		if update.CallbackQuery != nil {
-			go b.handleCallback(update.CallbackQuery)
-			continue
+	client := &http.Client{Timeout: 65 * time.Second}
+	offset := 0
+	for {
+		updates, newOffset := b.fetchUpdates(offset, client)
+		offset = newOffset
+		for _, upd := range updates {
+			if upd.CallbackQuery != nil {
+				go b.handleCallback(upd.CallbackQuery)
+				continue
+			}
+			if upd.Message == nil || upd.Message.Chat.ID != b.chatID {
+				continue
+			}
+			go b.handleMessage(&upd.Message.Message, upd.Message.MessageThreadID)
 		}
-		if update.Message == nil || update.Message.Chat.ID != b.chatID {
-			continue
-		}
-		go b.handleMessage(update.Message)
 	}
-	return nil
+}
+
+func (b *Bot) fetchUpdates(offset int, client *http.Client) ([]extUpdate, int) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=60&allowed_updates=message,callback_query",
+		b.cfg.TelegramToken, offset)
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("getUpdates: %v", err)
+		time.Sleep(5 * time.Second)
+		return nil, offset
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK     bool        `json:"ok"`
+		Result []extUpdate `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("getUpdates decode: %v", err)
+		return nil, offset
+	}
+
+	newOffset := offset
+	for _, u := range result.Result {
+		if u.UpdateID+1 > newOffset {
+			newOffset = u.UpdateID + 1
+		}
+	}
+	return result.Result, newOffset
 }
 
 // ── Routing ───────────────────────────────────────────────────
 
-func (b *Bot) handleMessage(msg *tgbotapi.Message) {
-	threadID := 0
+func (b *Bot) handleMessage(msg *tgbotapi.Message, threadID int) {
 	if msg.Voice != nil {
 		b.handleVoice(msg, threadID)
 		return
@@ -236,7 +281,7 @@ func (b *Bot) runCodingTask(description string, _ int) {
 	// Создаём живой трекер прогресса
 	pt := NewProgressTracker(b, description, o, r, taskThreadID)
 
-	agent := NewAgent(b.cfg, o, r).WithProgress(pt)
+	agent := NewAgent(b.cfg, o, r).WithProgress(pt).WithBot(b, taskThreadID)
 	go agent.Run(task)
 	go b.drainSteps(task, pt, taskThreadID)
 }
@@ -303,7 +348,7 @@ func (b *Bot) watchCI(task *Task, prNum int, prURL string, pt *ProgressTracker, 
 			Steps: make(chan Step, 50),
 		}
 		fixPT := NewProgressTracker(b, "Fix CI tests", task.Owner, task.Repo, threadID)
-		go NewAgent(b.cfg, task.Owner, task.Repo).WithProgress(fixPT).Run(fix)
+		go NewAgent(b.cfg, task.Owner, task.Repo).WithProgress(fixPT).WithBot(b, threadID).Run(fix)
 		go b.drainSteps(fix, fixPT, threadID)
 
 	case "timeout":
