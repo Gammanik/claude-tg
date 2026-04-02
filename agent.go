@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-// ── Task ──────────────────────────────────────────────────────
-
 type StepType string
 
 const (
@@ -33,31 +31,31 @@ type Step struct {
 type Task struct {
 	ID          string
 	Description string
-	Owner       string
-	Repo        string
+	Owner, Repo string
 	Branch      string
 	Steps       chan Step
+	StartedAt   time.Time
 }
 
-// ── Agent ─────────────────────────────────────────────────────
-
 type Agent struct {
-	cfg   Config
-	gh    *GitHubClient
-	owner string
-	repo  string
+	cfg         Config
+	gh          *GitHubClient
+	owner, repo string
+	progress    *ProgressTracker // может быть nil
 }
 
 func NewAgent(cfg Config, owner, repo string) *Agent {
-	return &Agent{
-		cfg:   cfg,
-		gh:    NewGitHubClient(cfg.GitHubToken, owner, repo),
-		owner: owner,
-		repo:  repo,
-	}
+	return &Agent{cfg: cfg, gh: NewGitHubClient(cfg.GitHubToken, owner, repo),
+		owner: owner, repo: repo}
+}
+
+func (a *Agent) WithProgress(pt *ProgressTracker) *Agent {
+	a.progress = pt
+	return a
 }
 
 func (a *Agent) Run(task *Task) {
+	task.StartedAt = time.Now()
 	defer func() {
 		if r := recover(); r != nil {
 			task.Steps <- Step{Type: StepError, Content: fmt.Sprintf("panic: %v", r)}
@@ -66,76 +64,101 @@ func (a *Agent) Run(task *Task) {
 	}()
 	defer close(task.Steps)
 
-	// 1. Читаем контекст
-	task.Steps <- Step{Type: StepThought, Content: "Читаю структуру репо..."}
+	a.think("Читаю структуру репо...", task)
 	ctx := a.buildContext(task.Description)
 
-	// 2. Создаём ветку (если не передана)
+	// Создаём ветку
+	branch := makeBranch(task.Description, task.ID)
+	if task.Branch != "" {
+		branch = task.Branch
+	}
+
+	a.act("git checkout -b "+branch, task)
 	if task.Branch == "" {
-		task.Branch = makeBranch(task.Description, task.ID)
-		if err := a.gh.CreateBranch(task.Branch); err != nil {
-			task.Steps <- Step{Type: StepError, Content: fmt.Sprintf("CreateBranch: %v", err)}
+		if err := a.gh.CreateBranch(branch); err != nil {
+			task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
 			return
 		}
 	}
-	task.Steps <- Step{Type: StepAction, Content: fmt.Sprintf("git checkout -b %s", task.Branch)}
+	task.Branch = branch
+	if a.progress != nil {
+		a.progress.SetBranch(branch)
+	}
 
-	// 3. ReAct loop
+	// ReAct loop
 	messages := []msg{
 		{Role: "system", Content: systemPrompt(a.owner, a.repo, ctx)},
 		{Role: "user", Content: task.Description},
 	}
 
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 25; i++ {
 		resp, err := a.llm(messages)
 		if err != nil {
-			task.Steps <- Step{Type: StepError, Content: fmt.Sprintf("LLM: %v", err)}
+			task.Steps <- Step{Type: StepError, Content: "LLM: " + err.Error()}
 			return
 		}
 		messages = append(messages, msg{Role: "assistant", Content: resp})
 
-		thought := extractThought(resp)
-		if thought != "" {
-			task.Steps <- Step{Type: StepThought, Content: thought}
+		if t := extractThought(resp); t != "" {
+			a.think(t, task)
 		}
 
 		actions := parseActions(resp)
 		if len(actions) == 0 {
-			// Нет action-тегов — агент, видимо, закончил без create_pr
 			task.Steps <- Step{Type: StepDone, Content: resp}
+			if a.progress != nil {
+				a.progress.Finish()
+			}
 			return
 		}
 
-		stop := false
 		for _, act := range actions {
-			result, prNum, prURL, done, err_ := a.execute(act, task.Branch, task.Steps)
-			if err_ != "" {
-				result = "error: " + err_
+			result, prNum, prURL, done, errMsg := a.execute(act, branch, task)
+			if errMsg != "" {
+				result = "error: " + errMsg
+				if a.progress != nil {
+					a.progress.DoneStep(true)
+				}
+			} else if a.progress != nil {
+				a.progress.DoneStep(false)
 			}
 			if prNum > 0 {
 				task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
+				if a.progress != nil {
+					a.progress.SetPR(prNum, prURL)
+				}
 				return
 			}
 			if done {
 				task.Steps <- Step{Type: StepDone, Content: result}
+				if a.progress != nil {
+					a.progress.Finish()
+				}
 				return
 			}
 			messages = append(messages, msg{Role: "user", Content: "Tool result:\n" + result})
-			if stop {
-				break
-			}
 		}
 	}
-
-	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов (20)"}
+	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов"}
 }
 
-// execute выполняет один tool call
-func (a *Agent) execute(act action, branch string, steps chan Step) (result string, prNum int, prURL string, done bool, errMsg string) {
-	steps <- Step{Type: StepAction, Content: fmt.Sprintf("%s(%s)", act.Tool, shortArgs(act.Args))}
+func (a *Agent) think(content string, task *Task) {
+	task.Steps <- Step{Type: StepThought, Content: content}
+}
+
+func (a *Agent) act(label string, task *Task) {
+	task.Steps <- Step{Type: StepAction, Content: label}
+}
+
+func (a *Agent) execute(act action, branch string, task *Task) (result string, prNum int, prURL string, done bool, errMsg string) {
+	// Сообщаем трекеру о старте шага
+	arg := shortArgs(act.Args)
+	if a.progress != nil {
+		a.progress.StartStep(act.Tool, arg)
+	}
+	task.Steps <- Step{Type: StepAction, Content: fmt.Sprintf("%s(%s)", act.Tool, truncateS(arg, 40))}
 
 	switch act.Tool {
-
 	case "read_file":
 		content, err := a.gh.GetContent(act.Args["path"], "main")
 		if err != nil {
@@ -151,7 +174,7 @@ func (a *Agent) execute(act action, branch string, steps chan Step) (result stri
 		if err != nil {
 			return "", 0, "", false, err.Error()
 		}
-		return fmt.Sprintf("wrote %s", act.Args["path"]), 0, "", false, ""
+		return "wrote " + act.Args["path"], 0, "", false, ""
 
 	case "list_files":
 		files, err := a.gh.ListDir(act.Args["path"], "main")
@@ -161,7 +184,6 @@ func (a *Agent) execute(act action, branch string, steps chan Step) (result stri
 		return strings.Join(files, "\n"), 0, "", false, ""
 
 	case "search_code":
-		// Ищем по файлам в репо (простой grep через GitHub search API)
 		results, err := a.gh.SearchCode(act.Args["query"])
 		if err != nil {
 			return "", 0, "", false, err.Error()
@@ -169,27 +191,21 @@ func (a *Agent) execute(act action, branch string, steps chan Step) (result stri
 		return results, 0, "", false, ""
 
 	case "spawn_subagent":
-		// Запускаем суб-агента для подзадачи
 		subTask := &Task{
-			ID:          fmt.Sprintf("sub-%d", time.Now().UnixNano()),
-			Description: act.Args["task"],
-			Owner:       a.owner,
-			Repo:        a.repo,
-			Branch:      branch, // тот же branch
-			Steps:       make(chan Step, 50),
+			ID: task.ID + "-sub", Description: act.Args["task"],
+			Owner: a.owner, Repo: a.repo, Branch: branch,
+			Steps: make(chan Step, 50),
 		}
-		subAgent := NewAgent(a.cfg, a.owner, a.repo)
-		go subAgent.Run(subTask)
-
-		// Собираем результат суб-агента
+		sub := NewAgent(a.cfg, a.owner, a.repo)
+		go sub.Run(subTask)
 		var sb strings.Builder
 		for step := range subTask.Steps {
-			steps <- step // проксируем шаги наверх
+			task.Steps <- step
 			if step.Type == StepDone {
 				sb.WriteString(step.Content)
 			}
 		}
-		return "subagent result: " + sb.String(), 0, "", false, ""
+		return "subagent: " + sb.String(), 0, "", false, ""
 
 	case "create_pr":
 		num, url, err := a.gh.CreatePR(branch, act.Args["title"], act.Args["body"])
@@ -202,47 +218,40 @@ func (a *Agent) execute(act action, branch string, steps chan Step) (result stri
 		return act.Args["summary"], 0, "", true, ""
 	}
 
-	return "", 0, "", false, fmt.Sprintf("unknown tool: %s", act.Tool)
+	return "", 0, "", false, "unknown tool: " + act.Tool
 }
 
-// buildContext читает ключевые файлы из репо
 func (a *Agent) buildContext(task string) string {
 	var parts []string
-
-	// CLAUDE.md или README.md
 	for _, f := range []string{"CLAUDE.md", "AGENT.md", "README.md"} {
-		if content, err := a.gh.GetContent(f, "main"); err == nil {
-			if len(content) > 3000 {
-				content = content[:3000] + "...[truncated]"
+		if c, err := a.gh.GetContent(f, "main"); err == nil {
+			if len(c) > 3000 {
+				c = c[:3000] + "..."
 			}
-			parts = append(parts, fmt.Sprintf("## %s\n%s", f, content))
+			parts = append(parts, "## "+f+"\n"+c)
 			break
 		}
 	}
-
-	// Структура src/
 	for _, dir := range []string{"src", ".", "lib", "app"} {
 		if files, err := a.gh.ListDir(dir, "main"); err == nil && len(files) > 0 {
-			parts = append(parts, fmt.Sprintf("## %s/ structure\n%s", dir, strings.Join(files, "\n")))
+			parts = append(parts, fmt.Sprintf("## %s/\n%s", dir, strings.Join(files, "\n")))
 			break
 		}
 	}
-
-	// package.json или go.mod
-	for _, f := range []string{"package.json", "go.mod", "pyproject.toml", "Cargo.toml"} {
-		if content, err := a.gh.GetContent(f, "main"); err == nil {
-			if len(content) > 1000 {
-				content = content[:1000]
+	for _, f := range []string{"package.json", "go.mod", "pyproject.toml"} {
+		if c, err := a.gh.GetContent(f, "main"); err == nil {
+			if len(c) > 800 {
+				c = c[:800]
 			}
-			parts = append(parts, fmt.Sprintf("## %s\n%s", f, content))
+			parts = append(parts, "## "+f+"\n"+c)
 			break
 		}
 	}
-
+	_ = task
 	return strings.Join(parts, "\n\n")
 }
 
-// ── LLM ───────────────────────────────────────────────────────
+// ── LLM ──────────────────────────────────────────────────────
 
 type msg struct {
 	Role    string `json:"role"`
@@ -258,15 +267,14 @@ func (a *Agent) llm(messages []msg) (string, error) {
 
 func callDeepSeek(key string, messages []msg) (string, error) {
 	body, _ := json.Marshal(map[string]any{
-		"model":       "deepseek-chat",
-		"messages":    messages,
-		"max_tokens":  8192,
-		"temperature": 0.1,
+		"model": "deepseek-chat", "max_tokens": 8192, "temperature": 0.1,
+		"messages": messages,
 	})
 	req, _ := http.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -285,16 +293,15 @@ func callClaude(key string, messages []msg) (string, error) {
 		}
 	}
 	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-sonnet-4-20250514",
-		"max_tokens": 8192,
-		"system":     system,
-		"messages":   rest,
+		"model": "claude-sonnet-4-20250514", "max_tokens": 8192,
+		"system": system, "messages": rest,
 	})
 	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -316,7 +323,7 @@ func parseOpenAI(r io.Reader) (string, error) {
 		return "", fmt.Errorf("API: %s", result.Error.Message)
 	}
 	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("empty response")
+		return "", fmt.Errorf("empty")
 	}
 	return result.Choices[0].Message.Content, nil
 }
@@ -340,32 +347,31 @@ func parseAnthropic(r io.Reader) (string, error) {
 			return c.Text, nil
 		}
 	}
-	return "", fmt.Errorf("no text block")
+	return "", fmt.Errorf("no text")
 }
 
-// ── ReAct parsing ─────────────────────────────────────────────
+// ── Parsing ───────────────────────────────────────────────────
 
 type action struct {
 	Tool string
 	Args map[string]string
 }
 
-var actionBlockRe = regexp.MustCompile(`(?s)<action>(.*?)</action>`)
-var toolRe = regexp.MustCompile(`tool:\s*(\w+)`)
+var actionRe = regexp.MustCompile(`(?s)<action>(.*?)</action>`)
+var toolRe = regexp.MustCompile(`tool:\s*"?(\w+)"?`)
 var argRe = regexp.MustCompile(`(?s)(\w+):\s*"((?:[^"\\]|\\.)*)"`)
 
 func parseActions(response string) []action {
 	var actions []action
-	for _, block := range actionBlockRe.FindAllStringSubmatch(response, -1) {
+	for _, block := range actionRe.FindAllStringSubmatch(response, -1) {
 		body := block[1]
-		toolMatch := toolRe.FindStringSubmatch(body)
-		if len(toolMatch) < 2 {
+		tm := toolRe.FindStringSubmatch(body)
+		if len(tm) < 2 {
 			continue
 		}
-		act := action{Tool: toolMatch[1], Args: make(map[string]string)}
+		act := action{Tool: tm[1], Args: make(map[string]string)}
 		for _, am := range argRe.FindAllStringSubmatch(body, -1) {
 			if am[1] != "tool" {
-				// Обрабатываем escape sequences
 				val := strings.ReplaceAll(am[2], `\n`, "\n")
 				val = strings.ReplaceAll(val, `\"`, `"`)
 				act.Args[am[1]] = val
@@ -376,19 +382,16 @@ func parseActions(response string) []action {
 	return actions
 }
 
-func extractThought(response string) string {
-	for _, line := range strings.Split(response, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Thought:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "Thought:"))
+func extractThought(r string) string {
+	for _, line := range strings.Split(r, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "Thought:") {
+			return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Thought:"))
 		}
 	}
 	return ""
 }
 
-// ── Utils ─────────────────────────────────────────────────────
-
-func makeBranch(desc, taskID string) string {
+func makeBranch(desc, id string) string {
 	re := regexp.MustCompile(`[^a-z0-9]+`)
 	slug := re.ReplaceAllString(strings.ToLower(desc), "-")
 	if len(slug) > 40 {
@@ -396,22 +399,18 @@ func makeBranch(desc, taskID string) string {
 	}
 	slug = strings.Trim(slug, "-")
 	if slug == "" {
-		slug = taskID
+		slug = id
 	}
 	return "feat/" + slug
 }
 
 func shortArgs(args map[string]string) string {
-	if p := args["path"]; p != "" {
-		return p
+	for _, k := range []string{"path", "title", "task", "query"} {
+		if v := args[k]; v != "" {
+			return truncateS(v, 40)
+		}
 	}
-	if t := args["title"]; t != "" {
-		return t
-	}
-	if t := args["task"]; t != "" {
-		return truncateS(t, 40)
-	}
-	return "..."
+	return ""
 }
 
 func truncateS(s string, max int) string {
@@ -421,68 +420,57 @@ func truncateS(s string, max int) string {
 	return s[:max] + "..."
 }
 
-// ── System Prompt ─────────────────────────────────────────────
-
 func systemPrompt(owner, repo, ctx string) string {
-	return fmt.Sprintf(`You are an AI coding agent for the GitHub repo %s/%s.
+	return fmt.Sprintf(`You are an AI coding agent for %s/%s.
 
 ## Project Context
 %s
 
-## Tools — use XML <action> tags
+## Tools
 
-Read a file:
 <action>
 tool: "read_file"
 path: "src/components/Example.jsx"
 </action>
 
-Write/update a file:
 <action>
 tool: "write_file"
-path: "src/components/NewThing.jsx"
-content: "import React from 'react';\n\nexport default function NewThing() {\n  return <div>Hello</div>;\n}"
-message: "feat: add NewThing component"
+path: "src/components/New.jsx"
+content: "import React from 'react';\nexport default function New() { return <div/>; }"
+message: "feat: add New component"
 </action>
 
-List directory:
 <action>
 tool: "list_files"
-path: "src/components"
+path: "src"
 </action>
 
-Search code:
 <action>
 tool: "search_code"
 query: "useUserData"
 </action>
 
-Spawn a sub-agent for a subtask (runs in same branch, results come back):
 <action>
 tool: "spawn_subagent"
-task: "Write a Playwright test for the TrackingScreen component"
+task: "Write Playwright test for TrackingScreen"
 </action>
 
-Open a PR (call this when all files are written):
 <action>
 tool: "create_pr"
 title: "feat: add tracking screen"
-body: "## Changes\n- Added TrackingScreen.jsx\n- Added useTracking.ts\n- Added playwright test"
+body: "## Changes\n- TrackingScreen.jsx\n- useTracking.ts\n- e2e test"
 </action>
 
-Signal completion without PR:
 <action>
 tool: "done"
-summary: "Analysis complete: the bug is in line 42 of api.js"
+summary: "Analysis complete"
 </action>
 
 ## Rules
-1. ALWAYS read files before writing — check existing patterns
-2. Every new UI component needs a Playwright test in tests/e2e/
-3. Every Supabase hook needs an integration test in tests/integration/
-4. Follow existing code style exactly
-5. After writing all files → call create_pr
-6. PR body lists every file changed
-7. For complex tasks: use spawn_subagent to parallelize work
-8. Write Thought: before each action block`, owner, repo, ctx)
+1. Read files before writing — check existing patterns
+2. Every new component → Playwright test in tests/e2e/
+3. Every Supabase hook → integration test in tests/integration/
+4. Follow existing code style
+5. After all files written → create_pr
+6. Write Thought: before each action`, owner, repo, ctx)
 }
