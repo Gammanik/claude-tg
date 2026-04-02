@@ -1,12 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -176,83 +173,6 @@ func (b *Bot) chat(text string, threadID int) {
 		full = "_(нет ответа)_"
 	}
 	b.edit(phID, full)
-}
-
-func (b *Bot) streamClaude(system, userText string, onChunk func(string)) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model": "claude-sonnet-4-20250514", "max_tokens": 1024, "stream": true,
-		"system":   system,
-		"messages": []map[string]string{{"role": "user", "content": userText}},
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	req.Header.Set("x-api-key", b.cfg.AnthropicKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var full strings.Builder
-	last := time.Now()
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			for _, line := range strings.Split(string(buf[:n]), "\n") {
-				if !strings.HasPrefix(line, "data: ") {
-					continue
-				}
-				var ev struct {
-					Delta struct {
-						Text string `json:"text"`
-					} `json:"delta"`
-				}
-				if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev) == nil && ev.Delta.Text != "" {
-					full.WriteString(ev.Delta.Text)
-					if time.Since(last) > 400*time.Millisecond {
-						onChunk(full.String())
-						last = time.Now()
-					}
-				}
-			}
-		}
-		if err == io.EOF || err != nil {
-			break
-		}
-	}
-	return full.String(), nil
-}
-
-func (b *Bot) callHaiku(system, text string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
-		"system":   system,
-		"messages": []map[string]string{{"role": "user", "content": text}},
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	req.Header.Set("x-api-key", b.cfg.AnthropicKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var result struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	json.NewDecoder(resp.Body).Decode(&result)
-	if len(result.Content) > 0 {
-		return result.Content[0].Text, nil
-	}
-	return "", fmt.Errorf("empty")
 }
 
 // ── Voice ─────────────────────────────────────────────────────

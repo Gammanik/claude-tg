@@ -4,37 +4,28 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"strings"
 )
 
-// directAction — вещи которые бот делает сам, без GitHub PR
 type directAction struct {
-	kind string // "set_avatar" | "set_name" | "set_description"
+	kind string
 	arg  string
 }
 
 func detectDirectAction(text string) *directAction {
 	lower := strings.ToLower(text)
-
-	// Аватарка
 	avatarKws := []string{"аватарк", "аву", "аватар", "фото бота", "avatar", "photo"}
 	changeKws := []string{"поменяй", "смени", "измени", "поставь", "set", "change", "update", "ко мне"}
-	isAvatar := containsAny(lower, avatarKws...)
-	isChange := containsAny(lower, changeKws...)
-	if isAvatar && isChange {
+	if containsAny(lower, avatarKws...) && containsAny(lower, changeKws...) {
 		return &directAction{kind: "set_avatar"}
 	}
-
-	// Имя бота
-	if containsAny(lower, "имя бота", "название бота", "переименуй бота", "bot name") &&
-		containsAny(lower, "поменяй", "смени", "измени", "set", "change") {
-		return &directAction{kind: "set_name", arg: extractQuoted(text)}
-	}
-
 	return nil
 }
 
@@ -47,35 +38,71 @@ func containsAny(s string, subs ...string) bool {
 	return false
 }
 
-func extractQuoted(text string) string {
-	if i := strings.Index(text, `"`); i >= 0 {
-		if j := strings.Index(text[i+1:], `"`); j >= 0 {
-			return text[i+1 : i+1+j]
+// setBotAvatar — ставит аватарку боту
+// Порядок попыток: DALL-E → dicebear → встроенная PNG
+func (b *Bot) setBotAvatar() error {
+	// 1. DALL-E если есть ключ
+	if b.cfg.OpenAIKey != "" {
+		if imgURL, err := b.generateAvatarDALLE(); err == nil {
+			if err := b.uploadAvatarFromURL(imgURL); err == nil {
+				return nil
+			}
 		}
 	}
-	return ""
+
+	// 2. Dicebear
+	dicebearURL := "https://api.dicebear.com/9.x/bottts-neutral/png?seed=claude-tg&backgroundColor=1a1a2e&size=512"
+	if err := b.uploadAvatarFromURL(dicebearURL); err == nil {
+		return nil
+	}
+
+	// 3. Fallback — генерируем PNG прямо в Go (без внешних зависимостей)
+	imgData := generateDefaultAvatar()
+	return b.uploadAvatarBytes(imgData, "avatar.png", "image/png")
 }
 
-// setBotAvatar — генерирует аватарку через DALL-E или берёт дефолтную, ставит боту
-func (b *Bot) setBotAvatar() error {
-	// Если есть OpenAI — генерируем через DALL-E
-	if b.cfg.OpenAIKey != "" {
-		imgURL, err := b.generateAvatarDALLE()
-		if err == nil {
-			return b.uploadAvatarFromURL(imgURL)
+// generateDefaultAvatar — рисует простую аватарку в памяти
+func generateDefaultAvatar() []byte {
+	const size = 256
+	img := image.NewRGBA(image.Rect(0, 0, size, size))
+
+	// Тёмно-синий фон
+	bg := color.RGBA{R: 26, G: 26, B: 46, A: 255}
+	draw.Draw(img, img.Bounds(), &image.Uniform{bg}, image.Point{}, draw.Src)
+
+	// Фиолетовый круг по центру
+	purple := color.RGBA{R: 124, G: 58, B: 237, A: 255}
+	cx, cy, r := size/2, size/2, size/3
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			dx, dy := x-cx, y-cy
+			if dx*dx+dy*dy <= r*r {
+				img.Set(x, y, purple)
+			}
 		}
-		log.Printf("DALL-E failed: %v, using default", err)
 	}
 
-	// Дефолт: красивая геометрическая аватарка (SVG → PNG через placeholder)
-	defaultURL := "https://api.dicebear.com/9.x/bottts-neutral/png?seed=claude-tg&backgroundColor=1a1a2e&size=512"
-	return b.uploadAvatarFromURL(defaultURL)
+	// Светлая точка (глаз)
+	white := color.RGBA{R: 220, G: 220, B: 255, A: 255}
+	er := size / 10
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			dx, dy := x-cx, y-cy-size/12
+			if dx*dx+dy*dy <= er*er {
+				img.Set(x, y, white)
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
 }
 
 func (b *Bot) generateAvatarDALLE() (string, error) {
 	body, _ := json.Marshal(map[string]any{
 		"model":   "dall-e-3",
-		"prompt":  "A sleek dark blue robot face with glowing purple circuit patterns, minimal design, clean background, suitable for a Telegram bot avatar",
+		"prompt":  "Minimalist robot face avatar, dark blue background, purple glowing eye, circuit pattern, clean geometric design for a Telegram bot, square format",
 		"n":       1,
 		"size":    "1024x1024",
 		"quality": "standard",
@@ -97,54 +124,86 @@ func (b *Bot) generateAvatarDALLE() (string, error) {
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
 	if len(result.Data) == 0 {
-		return "", fmt.Errorf("no image generated")
+		return "", fmt.Errorf("no image")
 	}
 	return result.Data[0].URL, nil
 }
 
 func (b *Bot) uploadAvatarFromURL(imgURL string) error {
-	// Скачиваем изображение
 	resp, err := http.Get(imgURL)
 	if err != nil {
-		return fmt.Errorf("download: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
+
 	imgData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-
-	// Определяем тип файла
-	contentType := resp.Header.Get("Content-Type")
-	ext := "jpg"
-	if strings.Contains(contentType, "png") || strings.HasSuffix(imgURL, ".png") {
-		ext = "png"
+	if len(imgData) < 1000 {
+		return fmt.Errorf("image too small (%d bytes)", len(imgData))
 	}
 
-	// Загружаем через setMyPhoto (Bot API 7.0+)
+	ct := resp.Header.Get("Content-Type")
+	ext := "jpg"
+	if strings.Contains(ct, "png") || strings.HasSuffix(imgURL, ".png") {
+		ext = "png"
+		ct = "image/png"
+	} else {
+		ct = "image/jpeg"
+	}
+
+	return b.uploadAvatarBytes(imgData, "avatar."+ext, ct)
+}
+
+func (b *Bot) uploadAvatarBytes(imgData []byte, filename, contentType string) error {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-	fw, _ := w.CreateFormFile("photo", "avatar."+ext)
+
+	// Создаём part с правильным content-type
+	h := make(map[string][]string)
+	h["Content-Disposition"] = []string{fmt.Sprintf(`form-data; name="photo"; filename="%s"`, filename)}
+	h["Content-Type"] = []string{contentType}
+	fw, err := w.CreatePart(h)
+	if err != nil {
+		return err
+	}
 	fw.Write(imgData)
 	w.Close()
 
+	// Пробуем setMyPhoto (Bot API 7.3+)
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/setMyPhoto", b.cfg.TelegramToken)
 	req, _ := http.NewRequest("POST", apiURL, &buf)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
-	apiResp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
-	defer apiResp.Body.Close()
+	defer resp.Body.Close()
 
 	var result struct {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
+		ErrorCode   int    `json:"error_code"`
 	}
-	json.NewDecoder(apiResp.Body).Decode(&result)
+	json.NewDecoder(resp.Body).Decode(&result)
+
 	if !result.OK {
-		return fmt.Errorf("Telegram API: %s", result.Description)
+		// setMyPhoto не поддерживается — говорим пользователю как поставить вручную
+		if result.ErrorCode == 404 {
+			return fmt.Errorf("setMyPhoto требует Bot API 7.3+.\n\nПоставь вручную:\n@BotFather → /setuserpic → @%s → загрузи фото", "claude_gammabot")
+		}
+		return fmt.Errorf("%s", result.Description)
 	}
 	return nil
+}
+
+func extractQuoted(text string) string {
+	if i := strings.Index(text, `"`); i >= 0 {
+		if j := strings.Index(text[i+1:], `"`); j >= 0 {
+			return text[i+1 : i+1+j]
+		}
+	}
+	return ""
 }
