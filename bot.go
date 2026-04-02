@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,12 +20,10 @@ type Bot struct {
 	cfg    Config
 	chatID int64
 
-	// Текущий активный репо (меняется командой /repo)
 	repoMu sync.RWMutex
 	owner  string
 	repo   string
 
-	// Активные задачи
 	tasksMu sync.Mutex
 	tasks   map[string]*Task
 }
@@ -43,21 +45,19 @@ func (b *Bot) Start() error {
 		return fmt.Errorf("telegram init: %w", err)
 	}
 	b.api = api
-	log.Printf("Authorized as @%s", api.Self.UserName)
+	log.Printf("✅ @%s online", api.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-
 	for update := range api.GetUpdatesChan(u) {
-		// Только наш chat
-		if update.Message != nil && update.Message.Chat.ID != b.chatID {
-			continue
-		}
 		if update.CallbackQuery != nil {
 			go b.handleCallback(update.CallbackQuery)
 			continue
 		}
 		if update.Message == nil {
+			continue
+		}
+		if update.Message.Chat.ID != b.chatID {
 			continue
 		}
 		go b.handleMessage(update.Message)
@@ -66,12 +66,10 @@ func (b *Bot) Start() error {
 }
 
 func (b *Bot) handleMessage(msg *tgbotapi.Message) {
-	// Голосовое сообщение
 	if msg.Voice != nil {
 		b.handleVoice(msg)
 		return
 	}
-
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		return
@@ -79,211 +77,245 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 
 	switch {
 	case text == "/start" || text == "/help":
-		b.send(helpText(b.currentRepo()))
-
+		b.send(b.helpText())
 	case text == "/status":
-		b.handleStatus()
-
+		b.sendStatus()
 	case text == "/prs":
-		b.handlePRs()
-
+		b.sendPRs()
 	case text == "/tasks":
-		b.handleTaskList()
-
+		b.sendTasks()
 	case strings.HasPrefix(text, "/repo "):
-		// /repo Gammanik/SkyFarm  — переключить репо
-		b.handleSetRepo(strings.TrimPrefix(text, "/repo "))
-
+		b.setRepo(strings.TrimPrefix(text, "/repo "))
 	case strings.HasPrefix(text, "/cancel "):
-		taskID := strings.TrimPrefix(text, "/cancel ")
-		b.cancelTask(taskID)
-
+		b.cancelTask(strings.TrimPrefix(text, "/cancel "))
 	default:
-		// Любой текст — задача для агента
-		b.runTask(text)
+		if b.looksLikeTask(text) {
+			b.runCodingTask(text)
+		} else {
+			b.chat(text)
+		}
 	}
+}
+
+func (b *Bot) looksLikeTask(text string) bool {
+	keywords := []string{
+		"добавь", "сделай", "создай", "напиши", "исправь", "fix", "add", "create",
+		"рефактори", "refactor", "удали", "перенеси", "реализуй", "implement",
+		"покрой тестами", "обнови", "update", "измени", "переименуй", "deploy",
+	}
+	lower := strings.ToLower(text)
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// chat — разговор со стримингом (ответ обновляется по мере генерации)
+func (b *Bot) chat(text string) {
+	ph := b.send("💭 _думаю..._")
+	o, r := b.currentRepo()
+	system := fmt.Sprintf(`Ты AI-ассистент разработчика Никиты. Текущее репо: %s/%s.
+Отвечай кратко и по делу на русском. Можешь обсуждать код, архитектуру, идеи.
+Если нужно что-то изменить в коде — скажи что нужно написать задачу явно.`, o, r)
+
+	full, err := b.streamClaude(system, text, func(partial string) {
+		b.editMsg(ph.MessageID, partial+" ▌")
+	})
+	if err != nil {
+		b.editMsg(ph.MessageID, "❌ "+err.Error())
+		return
+	}
+	b.editMsg(ph.MessageID, full)
+}
+
+func (b *Bot) streamClaude(system, userText string, onChunk func(string)) (string, error) {
+	body, _ := json.Marshal(map[string]any{
+		"model":      "claude-sonnet-4-20250514",
+		"max_tokens": 1024,
+		"stream":     true,
+		"system":     system,
+		"messages":   []map[string]string{{"role": "user", "content": userText}},
+	})
+	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	req.Header.Set("x-api-key", b.cfg.AnthropicKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var full strings.Builder
+	lastUpd := time.Now()
+	buf := make([]byte, 4096)
+
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			for _, line := range strings.Split(string(buf[:n]), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				data := strings.TrimPrefix(line, "data: ")
+				if data == "[DONE]" {
+					break
+				}
+				var ev struct {
+					Delta struct {
+						Text string `json:"text"`
+					} `json:"delta"`
+				}
+				if json.Unmarshal([]byte(data), &ev) == nil && ev.Delta.Text != "" {
+					full.WriteString(ev.Delta.Text)
+					if time.Since(lastUpd) > 400*time.Millisecond {
+						onChunk(full.String())
+						lastUpd = time.Now()
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+	}
+	return full.String(), nil
 }
 
 func (b *Bot) handleVoice(msg *tgbotapi.Message) {
-	b.send("🎤 Распознаю голосовое...")
-
-	// Скачиваем OGG файл
+	ph := b.send("🎤 _распознаю..._")
 	fileURL, err := b.api.GetFileDirectURL(msg.Voice.FileID)
 	if err != nil {
-		b.send(fmt.Sprintf("❌ Не смог получить файл: %v", err))
+		b.editMsg(ph.MessageID, "❌ "+err.Error())
 		return
 	}
-
-	// Транскрибируем через Groq Whisper (бесплатно) или OpenAI
-	voice := NewVoice(b.cfg)
-	text, err := voice.Transcribe(fileURL)
+	text, err := NewVoice(b.cfg).Transcribe(fileURL)
 	if err != nil {
-		b.send(fmt.Sprintf("❌ Транскрипция не удалась: %v", err))
+		b.editMsg(ph.MessageID, "❌ STT: "+err.Error()+
+			"\n\n👉 Добавь `GROQ_API_KEY` в Railway Variables (бесплатно: console.groq.com)")
 		return
 	}
-
-	b.send(fmt.Sprintf("📝 Распознал: _%s_\n\nЗапускаю...", text))
-	b.runTask(text)
+	b.editMsg(ph.MessageID, "🎤 _"+text+"_")
+	time.Sleep(300 * time.Millisecond)
+	if b.looksLikeTask(text) {
+		b.runCodingTask(text)
+	} else {
+		b.chat(text)
+	}
 }
 
-func (b *Bot) runTask(description string) {
-	owner, repo := b.currentRepo()
-	taskID := fmt.Sprintf("%d", time.Now().Unix())
-
+func (b *Bot) runCodingTask(description string) {
+	o, r := b.currentRepo()
+	taskID := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	task := &Task{
-		ID:          taskID,
-		Description: description,
-		Owner:       owner,
-		Repo:        repo,
-		Steps:       make(chan Step, 100),
+		ID: taskID, Description: description,
+		Owner: o, Repo: r,
+		Steps: make(chan Step, 100),
 	}
-
 	b.tasksMu.Lock()
 	b.tasks[taskID] = task
 	b.tasksMu.Unlock()
 
-	b.send(fmt.Sprintf("⚙️ Задача `%s` запущена\nРепо: `%s/%s`", taskID, owner, repo))
+	b.send(fmt.Sprintf("⚙️ Задача `%s`\nРепо: `%s/%s`\n\n_%s_",
+		taskID, o, r, truncate(description, 80)))
 
-	// Запускаем агента
-	agent := NewAgent(b.cfg, owner, repo)
+	agent := NewAgent(b.cfg, o, r)
 	go agent.Run(task)
-
-	// Читаем шаги и отправляем в TG
 	go b.streamSteps(task)
 }
 
 func (b *Bot) streamSteps(task *Task) {
-	var lastPRNum int
-	var lastPRURL string
-
 	for step := range task.Steps {
 		switch step.Type {
 		case StepThought:
-			b.send(fmt.Sprintf("💭 _%s_", step.Content))
-
+			b.send("💭 _" + step.Content + "_")
 		case StepAction:
-			b.send(fmt.Sprintf("🔧 `%s`", step.Content))
-
+			b.send("🔧 `" + step.Content + "`")
 		case StepPR:
-			lastPRNum = step.PRNumber
-			lastPRURL = step.PRURL
-			b.sendButtons(
-				fmt.Sprintf("🚀 [PR #%d](%s) открыт\nЖду тесты CI...", step.PRNumber, step.PRURL),
-				[]Button{
-					{Label: "🗑 Закрыть", Data: fmt.Sprintf("close:%d", step.PRNumber)},
-				},
+			b.sendWithButtons(
+				fmt.Sprintf("🚀 [PR #%d](%s) открыт — жду CI...", step.PRNumber, step.PRURL),
+				[]Button{{"🗑 Закрыть PR", fmt.Sprintf("close:%d", step.PRNumber)}},
 			)
-			go b.watchCI(task.ID, step.PRNumber)
-
+			go b.watchCI(task, step.PRNumber)
 		case StepError:
-			b.send(fmt.Sprintf("❌ %s", step.Content))
-
+			b.send("❌ " + step.Content)
+			b.removeTask(task.ID)
 		case StepDone:
-			b.send(fmt.Sprintf("✅ Готово!\n%s", step.Content))
-			// Отправляем голосовое резюме если настроен TTS
+			b.send("✅ " + step.Content)
 			if b.cfg.OpenAIKey != "" {
-				go b.sendVoiceSummary(step.Content)
+				go func(content string) {
+					if ogg, err := NewVoice(b.cfg).Synthesize(truncate(content, 300)); err == nil {
+						b.api.Send(tgbotapi.NewVoice(b.chatID,
+							tgbotapi.FileBytes{Name: "done.ogg", Bytes: ogg}))
+					}
+				}(step.Content)
 			}
 			b.removeTask(task.ID)
 		}
 	}
-
-	_ = lastPRNum
-	_ = lastPRURL
 }
 
-func (b *Bot) watchCI(taskID string, prNum int) {
-	gh := NewGitHubClient(b.cfg.GitHubToken, b.getTaskOwner(taskID), b.getTaskRepo(taskID))
-	result := gh.WatchChecks(prNum)
-
-	switch result {
+func (b *Bot) watchCI(task *Task, prNum int) {
+	gh := NewGitHubClient(b.cfg.GitHubToken, task.Owner, task.Repo)
+	switch gh.WatchChecks(prNum) {
 	case "success":
 		if err := gh.MergePR(prNum); err != nil {
-			b.send(fmt.Sprintf("⚠️ Тесты ок, но автомерж упал: %v", err))
+			b.send(fmt.Sprintf("⚠️ Тесты ✅, автомерж ❌: %v", err))
 		} else {
-			b.send(fmt.Sprintf("✅ PR #%d смержен автоматически 🎉", prNum))
-			b.removeTask(taskID)
+			b.send(fmt.Sprintf("✅ PR #%d смержен 🎉", prNum))
+			b.removeTask(task.ID)
 		}
-
 	case "failure":
 		log_ := gh.GetFailLog(prNum)
-		b.send(fmt.Sprintf("❌ Тесты упали:\n```\n%s\n```\nПробую починить...", truncate(log_, 600)))
-
-		// Субагент-фиксер
-		b.tasksMu.Lock()
-		task := b.tasks[taskID]
-		b.tasksMu.Unlock()
-
-		if task != nil {
-			agent := NewAgent(b.cfg, task.Owner, task.Repo)
-			fixTask := &Task{
-				ID:          taskID + "-fix",
-				Description: fmt.Sprintf("Fix failing tests. Error log:\n%s", log_),
-				Owner:       task.Owner,
-				Repo:        task.Repo,
-				Branch:      task.Branch,
-				Steps:       make(chan Step, 50),
-			}
-			go agent.Run(fixTask)
-			go b.streamSteps(fixTask)
+		b.send("❌ Тесты упали:\n```\n" + truncate(log_, 500) + "\n```\nПробую починить...")
+		fix := &Task{
+			ID: task.ID + "-fix", Description: "Fix CI tests. Log:\n" + log_,
+			Owner: task.Owner, Repo: task.Repo, Branch: task.Branch,
+			Steps: make(chan Step, 50),
 		}
-
+		go NewAgent(b.cfg, task.Owner, task.Repo).Run(fix)
+		go b.streamSteps(fix)
 	case "timeout":
-		b.send(fmt.Sprintf("⏰ CI не завершился за 20 мин\nhttps://github.com/%s/%s/pull/%d",
-			b.getTaskOwner(taskID), b.getTaskRepo(taskID), prNum))
+		b.send(fmt.Sprintf("⏰ CI timeout\nhttps://github.com/%s/%s/pull/%d",
+			task.Owner, task.Repo, prNum))
 	}
 }
 
-// Голосовой ответ-резюме
-func (b *Bot) sendVoiceSummary(text string) {
-	voice := NewVoice(b.cfg)
-	oggData, err := voice.Synthesize(text)
-	if err != nil {
-		return // молча, TTS опциональный
-	}
-	voiceMsg := tgbotapi.NewVoice(b.chatID, tgbotapi.FileBytes{
-		Name:  "summary.ogg",
-		Bytes: oggData,
-	})
-	b.api.Send(voiceMsg)
-}
-
-// /repo owner/name
-func (b *Bot) handleSetRepo(arg string) {
-	parts := strings.Split(strings.TrimSpace(arg), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		b.send("❌ Формат: `/repo owner/reponame`")
+func (b *Bot) setRepo(arg string) {
+	p := strings.Split(strings.TrimSpace(arg), "/")
+	if len(p) != 2 {
+		b.send("❌ Формат: `/repo owner/name`")
 		return
 	}
 	b.repoMu.Lock()
-	b.owner = parts[0]
-	b.repo = parts[1]
+	b.owner, b.repo = p[0], p[1]
 	b.repoMu.Unlock()
-	b.send(fmt.Sprintf("✅ Репо переключено на `%s/%s`", parts[0], parts[1]))
+	b.send(fmt.Sprintf("✅ Репо: `%s/%s`", p[0], p[1]))
 }
 
-func (b *Bot) handleStatus() {
-	b.repoMu.RLock()
-	owner, repo := b.owner, b.repo
-	b.repoMu.RUnlock()
-
+func (b *Bot) sendStatus() {
+	o, r := b.currentRepo()
 	b.tasksMu.Lock()
-	count := len(b.tasks)
+	n := len(b.tasks)
 	b.tasksMu.Unlock()
-
-	b.send(fmt.Sprintf("📊 *Статус*\nРепо: `%s/%s`\nАктивных задач: %d", owner, repo, count))
+	b.send(fmt.Sprintf("📊 Репо: `%s/%s` | Задач: %d", o, r, n))
 }
 
-func (b *Bot) handlePRs() {
-	owner, repo := b.currentRepo()
-	gh := NewGitHubClient(b.cfg.GitHubToken, owner, repo)
-	prs, err := gh.ListPRs()
+func (b *Bot) sendPRs() {
+	o, r := b.currentRepo()
+	prs, err := NewGitHubClient(b.cfg.GitHubToken, o, r).ListPRs()
 	if err != nil {
-		b.send(fmt.Sprintf("❌ %v", err))
+		b.send("❌ " + err.Error())
 		return
 	}
 	if len(prs) == 0 {
-		b.send("🟢 Открытых PR нет")
+		b.send("🟢 Нет открытых PR")
 		return
 	}
 	var sb strings.Builder
@@ -294,7 +326,7 @@ func (b *Bot) handlePRs() {
 	b.send(sb.String())
 }
 
-func (b *Bot) handleTaskList() {
+func (b *Bot) sendTasks() {
 	b.tasksMu.Lock()
 	defer b.tasksMu.Unlock()
 	if len(b.tasks) == 0 {
@@ -302,85 +334,65 @@ func (b *Bot) handleTaskList() {
 		return
 	}
 	var sb strings.Builder
-	sb.WriteString("⚙️ *Активные задачи:*\n")
+	sb.WriteString("⚙️ *Задачи:*\n")
 	for id, t := range b.tasks {
 		sb.WriteString(fmt.Sprintf("• `%s` — %s\n", id, truncate(t.Description, 50)))
 	}
 	b.send(sb.String())
 }
 
-func (b *Bot) cancelTask(taskID string) {
+func (b *Bot) cancelTask(id string) {
 	b.tasksMu.Lock()
-	task, ok := b.tasks[taskID]
+	t, ok := b.tasks[id]
 	if ok {
-		close(task.Steps)
-		delete(b.tasks, taskID)
+		close(t.Steps)
+		delete(b.tasks, id)
 	}
 	b.tasksMu.Unlock()
 	if ok {
-		b.send(fmt.Sprintf("🛑 Задача `%s` отменена", taskID))
+		b.send(fmt.Sprintf("🛑 `%s` отменена", id))
 	} else {
-		b.send(fmt.Sprintf("❓ Задача `%s` не найдена", taskID))
+		b.send("❓ Задача не найдена")
 	}
 }
 
 func (b *Bot) handleCallback(q *tgbotapi.CallbackQuery) {
 	b.api.Request(tgbotapi.NewCallback(q.ID, ""))
 	if strings.HasPrefix(q.Data, "close:") {
-		prNum, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "close:"))
-		owner, repo := b.currentRepo()
-		gh := NewGitHubClient(b.cfg.GitHubToken, owner, repo)
-		gh.ClosePR(prNum)
-		b.send(fmt.Sprintf("🗑 PR #%d закрыт", prNum))
+		n, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "close:"))
+		o, r := b.currentRepo()
+		NewGitHubClient(b.cfg.GitHubToken, o, r).ClosePR(n)
+		b.send(fmt.Sprintf("🗑 PR #%d закрыт", n))
 	}
 }
 
-// Helpers
 func (b *Bot) currentRepo() (string, string) {
 	b.repoMu.RLock()
 	defer b.repoMu.RUnlock()
 	return b.owner, b.repo
 }
 
-func (b *Bot) getTaskOwner(taskID string) string {
+func (b *Bot) removeTask(id string) {
 	b.tasksMu.Lock()
-	defer b.tasksMu.Unlock()
-	if t, ok := b.tasks[taskID]; ok {
-		return t.Owner
-	}
-	return b.owner
-}
-
-func (b *Bot) getTaskRepo(taskID string) string {
-	b.tasksMu.Lock()
-	defer b.tasksMu.Unlock()
-	if t, ok := b.tasks[taskID]; ok {
-		return t.Repo
-	}
-	return b.repo
-}
-
-func (b *Bot) removeTask(taskID string) {
-	b.tasksMu.Lock()
-	delete(b.tasks, taskID)
+	delete(b.tasks, id)
 	b.tasksMu.Unlock()
 }
 
-type Button struct {
-	Label string
-	Data  string
-}
-
-func (b *Bot) send(text string) {
+func (b *Bot) send(text string) tgbotapi.Message {
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	msg.ParseMode = "Markdown"
 	msg.DisableWebPagePreview = true
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send: %v", err)
-	}
+	m, _ := b.api.Send(msg)
+	return m
 }
 
-func (b *Bot) sendButtons(text string, buttons []Button) {
+func (b *Bot) editMsg(id int, text string) {
+	e := tgbotapi.NewEditMessageText(b.chatID, id, text)
+	e.ParseMode = "Markdown"
+	b.api.Send(e)
+}
+
+func (b *Bot) sendWithButtons(text string, buttons []Button) {
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	msg.ParseMode = "Markdown"
 	msg.DisableWebPagePreview = true
@@ -392,30 +404,26 @@ func (b *Bot) sendButtons(text string, buttons []Button) {
 	b.api.Send(msg)
 }
 
+func (b *Bot) helpText() string {
+	o, r := b.currentRepo()
+	return fmt.Sprintf("🤖 *claude-tg*\nРепо: `%s/%s`\n\n"+
+		"Пиши что угодно:\n"+
+		"— вопросы и разговор → отвечу сразу\n"+
+		"— задачи на код → ветка + код + PR + автомерж\n\n"+
+		"*Самомодификация:*\n"+
+		"`/repo Gammanik/claude-tg` → давай задачи на меня 🔄\n\n"+
+		"*Команды:*\n"+
+		"`/repo owner/name` — сменить репо\n"+
+		"`/prs` — открытые PR\n"+
+		"`/tasks` — активные задачи\n"+
+		"`/status` — статус", o, r)
+}
+
+type Button struct{ Label, Data string }
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return "..." + s[len(s)-max:]
-}
-
-func helpText(owner, repo string) string {
-	return fmt.Sprintf(`🤖 *claude-tg dev bot*
-
-Текущее репо: `+"`%s/%s`"+`
-
-*Пиши задачи текстом или голосовым:*
-_"добавь экран трекинга посылки"_
-_"рефактори SearchCouriers на страницы"_
-_"исправь баг с датами"_
-
-Я создам ветку → напишу код + тест → открою PR → автомерж если CI зелёный.
-
-*Команды:*
-`+"`/repo owner/name`"+` — переключить репо
-`+"`/prs`"+` — открытые PR
-`+"`/tasks`"+` — активные задачи
-`+"`/cancel <id>`"+` — отменить задачу
-`+"`/status`"+` — статус
-`+"`/help`"+` — это меню`, owner, repo)
+	return s[:max] + "..."
 }
