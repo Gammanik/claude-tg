@@ -1,3 +1,6 @@
+//go:build test_claude
+// +build test_claude
+
 package main
 
 import (
