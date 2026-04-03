@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -14,9 +15,11 @@ import (
 // streamClaude — надёжный SSE стриминг через bufio.Scanner
 // Обновляет Telegram каждые 400мс
 func (b *Bot) streamClaude(system, userText string, onChunk func(string)) (string, error) {
+	log.Printf("streamClaude: start, userText=%q", truncate(userText, 50))
+
 	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-sonnet-4-20250514",
-		"max_tokens": 1024,
+		"model":      "claude-opus-4-5-20251101",
+		"max_tokens": 2048,
 		"stream":     true,
 		"system":     system,
 		"messages":   []map[string]string{{"role": "user", "content": userText}},
@@ -27,15 +30,19 @@ func (b *Bot) streamClaude(system, userText string, onChunk func(string)) (strin
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
 
+	log.Printf("streamClaude: sending request to Anthropic API")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("streamClaude: request error - %v", err)
 		return "", fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	log.Printf("streamClaude: got response, status=%d", resp.StatusCode)
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
+		log.Printf("streamClaude: API error - %s", string(body))
 		return "", fmt.Errorf("API %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -97,8 +104,8 @@ func (b *Bot) streamClaude(system, userText string, onChunk func(string)) (strin
 // callClaudeOnce — обычный (не стриминговый) вызов, используется как fallback
 func (b *Bot) callClaudeOnce(system, userText string) (string, error) {
 	reqBody, _ := json.Marshal(map[string]any{
-		"model":      "claude-sonnet-4-20250514",
-		"max_tokens": 1024,
+		"model":      "claude-opus-4-5-20251101",
+		"max_tokens": 2048,
 		"system":     system,
 		"messages":   []map[string]string{{"role": "user", "content": userText}},
 	})

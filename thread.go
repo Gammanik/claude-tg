@@ -100,15 +100,29 @@ func (b *Bot) sendMessageRaw(text string, threadID int) int {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", b.cfg.TelegramToken)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("sendRaw: %v", err)
+		log.Printf("sendMessageRaw: error - %v", err)
 		return 0
 	}
 	defer resp.Body.Close()
+
 	var result struct {
+		OK     bool `json:"ok"`
 		Result struct {
 			MessageID int `json:"message_id"`
 		} `json:"result"`
+		Description string `json:"description"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
-	return result.Result.MessageID
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("sendMessageRaw: decode error - %v", err)
+		return 0
+	}
+
+	if !result.OK {
+		log.Printf("sendMessageRaw: API error - %s", result.Description)
+		return 0
+	}
+
+	msgID := result.Result.MessageID
+	log.Printf("sendMessageRaw: sent msgID=%d threadID=%d", msgID, threadID)
+	return msgID
 }

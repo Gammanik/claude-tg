@@ -40,7 +40,7 @@ AI-powered Telegram coding assistant that autonomously handles development tasks
 - 🎨 `set_avatar` - Update bot avatar
 
 ### 🧠 AI Features
-- **Multi-provider LLM**: Claude Sonnet 4 or DeepSeek
+- **Multi-provider LLM**: Claude Opus 4.5 or DeepSeek
 - **Prompt Caching**: Reduces costs with Anthropic's prompt caching
 - **Streaming Responses**: Real-time output with 400ms updates
 - **ReAct Pattern**: Thought → Action → Observation loop (max 25 iterations)
@@ -401,15 +401,15 @@ peerpack-bot/
 
 ## Cost Estimation
 
-**Claude Sonnet 4** (typical task):
-- Input: 15K tokens × $3/MTok = $0.045
-- Output: 3K tokens × $15/MTok = $0.045
-- Cache read: 12K × $0.30/MTok = $0.0036
-- **Total**: ~$0.09 per task
+**Claude Opus 4.5** (typical task):
+- Input: 15K tokens × $15/MTok = $0.225
+- Output: 3K tokens × $75/MTok = $0.225
+- Cache read: 12K × $1.50/MTok = $0.018
+- **Total**: ~$0.47 per task
 
 **DeepSeek** (budget option):
-- Much cheaper alternative
-- Slightly lower quality
+- Much cheaper alternative (~$0.01 per task)
+- Good quality, recommended for cost-sensitive use cases
 
 ## Development
 
@@ -476,7 +476,7 @@ MIT License - see LICENSE file
 ## Credits
 
 Built with:
-- [Claude Sonnet 4](https://www.anthropic.com/claude) - AI reasoning
+- [Claude Opus 4.5](https://www.anthropic.com/claude) - AI reasoning
 - [go-telegram-bot-api](https://github.com/go-telegram-bot-api/telegram-bot-api) - Telegram integration
 - [GitHub API](https://docs.github.com/en/rest) - Repository management
 - [Groq](https://groq.com/) - Free Whisper STT
@@ -485,4 +485,4 @@ Built with:
 
 **Made with ❤️ by [@Gammanik](https://github.com/Gammanik)**
 
-**Powered by Claude Sonnet 4.5**
+**Powered by Claude Opus 4.5**

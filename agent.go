@@ -579,7 +579,7 @@ func callClaude(key string, messages []msg) (string, error) {
 		{"type": "text", "text": system, "cache_control": map[string]string{"type": "ephemeral"}},
 	}
 	body, _ := json.Marshal(map[string]any{
-		"model": "claude-sonnet-4-20250514", "max_tokens": 8192,
+		"model": "claude-opus-4-5-20251101", "max_tokens": 16384,
 		"system": systemBlocks, "messages": rest,
 	})
 	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))

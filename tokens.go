@@ -60,13 +60,13 @@ func (ts *TokenStats) Format() string {
 			formatNumber(ts.cacheWrite))
 	}
 
-	// Оценка стоимости для Claude Sonnet 4
-	// $3 per MTok input, $15 per MTok output
-	// Кэш read: $0.30/MTok, кэш write: $3.75/MTok
-	costInput := float64(ts.inputTokens) / 1_000_000 * 3.0
-	costOutput := float64(ts.outputTokens) / 1_000_000 * 15.0
-	costCacheRead := float64(ts.cacheRead) / 1_000_000 * 0.30
-	costCacheWrite := float64(ts.cacheWrite) / 1_000_000 * 3.75
+	// Оценка стоимости для Claude Opus 4.5
+	// $15 per MTok input, $75 per MTok output
+	// Кэш read: $1.50/MTok, кэш write: $18.75/MTok
+	costInput := float64(ts.inputTokens) / 1_000_000 * 15.0
+	costOutput := float64(ts.outputTokens) / 1_000_000 * 75.0
+	costCacheRead := float64(ts.cacheRead) / 1_000_000 * 1.50
+	costCacheWrite := float64(ts.cacheWrite) / 1_000_000 * 18.75
 	totalCost := costInput + costOutput + costCacheRead + costCacheWrite
 
 	result += fmt.Sprintf("\n💰 ~$%.4f (%s)", totalCost, fmtDuration(elapsed.Round(time.Second)))
