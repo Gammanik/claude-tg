@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -228,81 +227,75 @@ func looksLikeReminder(lower string) bool {
 
 // ── Chat ──────────────────────────────────────────────────────
 
-// handleUserMessage - главный обработчик сообщений, умный LLM с тулами
+// handleUserMessage - главный обработчик сообщений
 func (b *Bot) handleUserMessage(text string) {
-	phID := b.tg("🤔 _думаю..._", 0)
-	log.Printf("handleUserMessage: text=%q", truncate(text, 100))
+	lower := strings.ToLower(text)
+
+	// Простая эвристика для задач
+	if looksLikeTask(lower) {
+		log.Printf("handleUserMessage: detected task, running agent")
+		b.runCodingTask(text, 0)
+		return
+	}
+
+	// Обычный чат
+	phID := b.tg("💭", 0)
+	log.Printf("handleUserMessage: chat mode, text=%q", truncate(text, 100))
 
 	o, r := b.currentRepo()
+	system := fmt.Sprintf(`Ты AI-ассистент разработчика Никиты. Репо: %s/%s. Отвечай кратко и по-дружески на русском.`, o, r)
 
-	// System prompt с возможностью вызвать агента через специальный тул
-	system := fmt.Sprintf(`Ты AI-ассистент разработчика Никиты. Репо: %s/%s.
+	// Используем провайдер из конфига
+	messages := []msg{
+		{Role: "system", Content: system},
+		{Role: "user", Content: text},
+	}
 
-Ты можешь:
-1. Отвечать на вопросы, общаться, объяснять концепции
-2. Выполнять задачи по кодингу используя специальный тул
-
-Если пользователь просит что-то сделать с кодом (добавить, исправить, рефакторить) - используй тул:
-<action>
-tool: "run_coding_task"
-description: "краткое описание задачи"
-</action>
-
-Иначе просто общайся как обычный AI-ассистент.
-
-Примеры:
-- "привет" → просто поздоровайся
-- "как работает Go?" → объясни
-- "добавь функцию сортировки" → используй run_coding_task
-- "исправь баг в auth.go" → используй run_coding_task`, o, r)
-
-	full, err := b.streamClaude(system, text, func(partial string) {
-		// Проверяем есть ли вызов тула в partial
-		if strings.Contains(partial, `tool: "run_coding_task"`) {
-			b.edit(phID, "⚙️ _запускаю агента..._")
-		} else {
+	// Пробуем со streaming если Anthropic
+	if b.cfg.LLMProvider == "claude" && b.cfg.AnthropicKey != "" {
+		full, err := b.streamClaude(system, text, func(partial string) {
 			b.edit(phID, partial+" ▌")
+		})
+		if err != nil {
+			log.Printf("handleUserMessage: stream error - %v, trying fallback", err)
+			// Fallback на обычный вызов
+			b.handleUserMessageFallback(text, phID, messages)
+			return
 		}
-	})
+		log.Printf("handleUserMessage: stream success, length=%d", len(full))
+		b.edit(phID, full)
 
+		// Голосовое сообщение для длинных ответов
+		if b.cfg.OpenAIKey != "" && len(full) > 300 {
+			go b.sendVoice(removeMarkdown(truncate(full, 500)), 0)
+		}
+		return
+	}
+
+	// Для других провайдеров - обычный вызов
+	b.handleUserMessageFallback(text, phID, messages)
+}
+
+// handleUserMessageFallback - обычный вызов LLM без streaming
+func (b *Bot) handleUserMessageFallback(text string, phID int, messages []msg) {
+	o, r := b.currentRepo()
+	agent := NewAgent(b.cfg, o, r)
+
+	resp, err := agent.llm(messages)
 	if err != nil {
 		errMsg := "❌ " + err.Error()
-		log.Printf("handleUserMessage: error - %v", err)
+		log.Printf("handleUserMessage: llm error - %v", err)
 		b.edit(phID, errMsg)
 		return
 	}
 
-	// Проверяем ответ на наличие action run_coding_task
-	if strings.Contains(full, `tool: "run_coding_task"`) {
-		// Парсим описание задачи
-		taskDesc := extractTaskDescription(full, text)
-		log.Printf("handleUserMessage: detected coding task: %q", taskDesc)
-
-		b.edit(phID, "") // убираем placeholder
-		b.runCodingTask(taskDesc, 0)
-		return
-	}
-
-	// Обычный ответ
-	log.Printf("handleUserMessage: chat response, length=%d", len(full))
-	b.edit(phID, full)
+	log.Printf("handleUserMessage: response length=%d", len(resp))
+	b.edit(phID, resp)
 
 	// Голосовое сообщение для длинных ответов
-	if b.cfg.OpenAIKey != "" && len(full) > 300 {
-		go b.sendVoice(removeMarkdown(truncate(full, 500)), 0)
+	if b.cfg.OpenAIKey != "" && len(resp) > 300 {
+		go b.sendVoice(removeMarkdown(truncate(resp, 500)), 0)
 	}
-}
-
-// extractTaskDescription извлекает описание из action или использует оригинальный текст
-func extractTaskDescription(response, originalText string) string {
-	// Ищем description: "..."
-	re := regexp.MustCompile(`description:\s*"([^"]+)"`)
-	matches := re.FindStringSubmatch(response)
-	if len(matches) > 1 && matches[1] != "" {
-		return matches[1]
-	}
-	// Fallback на оригинальный текст
-	return originalText
 }
 
 func (b *Bot) chat(text string, threadID int) {
