@@ -27,6 +27,25 @@ func NewGitHubClient(token, owner, repo string) *GitHubClient {
 	}
 }
 
+// ValidateToken проверяет валидность GitHub токена
+func (c *GitHubClient) ValidateToken() (string, error) {
+	var user struct {
+		Login   string `json:"login"`
+		Message string `json:"message"`
+	}
+	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err := c.do(req, &user); err != nil {
+		return "", fmt.Errorf("GitHub API error: %w", err)
+	}
+	if user.Message != "" {
+		return "", fmt.Errorf("invalid token: %s", user.Message)
+	}
+	if user.Login == "" {
+		return "", fmt.Errorf("token is invalid or has insufficient permissions")
+	}
+	return user.Login, nil
+}
+
 // ── Branch ───────────────────────────────────────────────────
 
 func (c *GitHubClient) CreateBranch(name string) error {

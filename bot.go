@@ -76,7 +76,7 @@ func (b *Bot) Start() error {
 	b.limits = NewUsageLimits()
 
 	// Проверка API ключей
-	b.checkLLMKeys()
+	b.checkAPIKeys()
 
 	log.Printf("✅ @%s online", api.Self.UserName)
 	go b.reminderLoop()
@@ -91,6 +91,7 @@ func (b *Bot) Start() error {
 				go b.handleCallback(upd.CallbackQuery)
 				continue
 			}
+
 			if upd.Message == nil || upd.Message.Chat.ID != b.chatID {
 				continue
 			}
@@ -996,7 +997,22 @@ func (b *Bot) currentRepo() (string, string) {
 	return b.owner, b.repo
 }
 
-func (b *Bot) checkLLMKeys() {
+func (b *Bot) checkAPIKeys() {
+	// Проверка GitHub токена
+	if b.cfg.GitHubToken == "" {
+		log.Printf("⚠️  WARNING: GITHUB_TOKEN not set - PR/repo operations will fail")
+		log.Printf("   Get token: https://github.com/settings/tokens/new")
+	} else {
+		gh := NewGitHubClient(b.cfg.GitHubToken, "test", "test")
+		if login, err := gh.ValidateToken(); err != nil {
+			log.Printf("❌ GitHub token INVALID: %v", err)
+			log.Printf("   Update GITHUB_TOKEN in .env: https://github.com/settings/tokens")
+		} else {
+			log.Printf("✅ GitHub: authenticated as @%s", login)
+		}
+	}
+
+	// Проверка LLM ключей
 	provider := b.cfg.LLMProvider
 	hasKey := false
 
