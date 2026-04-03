@@ -74,6 +74,10 @@ func (b *Bot) Start() error {
 	b.api = api
 	b.history = NewMessageHistory(api, b.chatID)
 	b.limits = NewUsageLimits()
+
+	// Проверка API ключей
+	b.checkLLMKeys()
+
 	log.Printf("✅ @%s online", api.Self.UserName)
 	go b.reminderLoop()
 
@@ -257,9 +261,10 @@ func (b *Bot) handleUserMessage(text string) {
 			b.edit(phID, partial+" ▌")
 		})
 		if err != nil {
-			log.Printf("handleUserMessage: stream error - %v, trying fallback", err)
-			// Fallback на обычный вызов
-			b.handleUserMessageFallback(text, phID, messages)
+			log.Printf("handleUserMessage: stream error - %v", err)
+			// Показываем красивую ошибку
+			errMsg := b.formatLLMError(err)
+			b.edit(phID, errMsg)
 			return
 		}
 		log.Printf("handleUserMessage: stream success, length=%d", len(full))
@@ -283,8 +288,10 @@ func (b *Bot) handleUserMessageFallback(text string, phID int, messages []msg) {
 
 	resp, err := agent.llm(messages)
 	if err != nil {
-		errMsg := "❌ " + err.Error()
 		log.Printf("handleUserMessage: llm error - %v", err)
+
+		// Красивое сообщение об ошибке
+		errMsg := b.formatLLMError(err)
 		b.edit(phID, errMsg)
 		return
 	}
@@ -296,6 +303,40 @@ func (b *Bot) handleUserMessageFallback(text string, phID int, messages []msg) {
 	if b.cfg.OpenAIKey != "" && len(resp) > 300 {
 		go b.sendVoice(removeMarkdown(truncate(resp, 500)), 0)
 	}
+}
+
+// formatLLMError форматирует ошибку LLM в понятное сообщение
+func (b *Bot) formatLLMError(err error) string {
+	errStr := err.Error()
+
+	// Уже отформатированные ошибки (из callClaude/callDeepSeek)
+	if strings.Contains(errStr, "👉") {
+		return errStr
+	}
+
+	// API ключ проблемы
+	if strings.Contains(errStr, "invalid x-api-key") || strings.Contains(errStr, "invalid_api_key") {
+		if b.cfg.LLMProvider == "claude" {
+			return `❌ *Неправильный Anthropic API ключ*
+
+Проверь переменную окружения:
+` + "`ANTHROPIC_API_KEY=sk-ant-...`" + `
+
+📝 Получить ключ: https://console.anthropic.com/settings/keys
+🔧 Или переключись на DeepSeek: ` + "`LLM_PROVIDER=deepseek`"
+		}
+		return `❌ *Неправильный API ключ*
+
+Проверь переменную: ` + "`" + strings.ToUpper(b.cfg.LLMProvider) + "_API_KEY`"
+	}
+
+	// Rate limit
+	if strings.Contains(errStr, "rate_limit") || strings.Contains(errStr, "429") {
+		return "⏰ *Rate limit превышен*\n\nПопробуй через минуту или смени провайдера в .env"
+	}
+
+	// Общая ошибка
+	return fmt.Sprintf("❌ *Ошибка LLM*\n\n`%s`\n\n💡 Проверь API ключи в .env", truncate(errStr, 200))
 }
 
 func (b *Bot) chat(text string, threadID int) {
@@ -806,6 +847,36 @@ func (b *Bot) currentRepo() (string, string) {
 	b.repoMu.RLock()
 	defer b.repoMu.RUnlock()
 	return b.owner, b.repo
+}
+
+func (b *Bot) checkLLMKeys() {
+	provider := b.cfg.LLMProvider
+	hasKey := false
+
+	switch provider {
+	case "claude":
+		hasKey = b.cfg.AnthropicKey != ""
+		if !hasKey {
+			log.Printf("⚠️  WARNING: LLM_PROVIDER=claude but ANTHROPIC_API_KEY not set")
+			log.Printf("   Chat mode will not work. Get key: https://console.anthropic.com/settings/keys")
+		} else {
+			log.Printf("✅ LLM: Claude (Anthropic API key configured)")
+		}
+	case "deepseek":
+		hasKey = b.cfg.DeepSeekKey != ""
+		if !hasKey {
+			log.Printf("⚠️  WARNING: LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY not set")
+			log.Printf("   Chat mode will not work. Get key: https://platform.deepseek.com")
+		} else {
+			log.Printf("✅ LLM: DeepSeek (API key configured)")
+		}
+	default:
+		log.Printf("⚠️  WARNING: Unknown LLM_PROVIDER=%s", provider)
+	}
+
+	if !hasKey {
+		log.Printf("💡 To enable chat: set %s_API_KEY in .env", strings.ToUpper(provider))
+	}
 }
 
 func (b *Bot) removeTask(id string) {
