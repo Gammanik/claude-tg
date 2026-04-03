@@ -161,50 +161,45 @@ func (b *Bot) route(text string, threadID int) {
 
 	switch {
 	case text == "/start" || text == "/help":
-		b.tg(b.helpText(), threadID)
+		b.tg(b.helpText(), 0)
 		return
 	case text == "/version":
-		b.sendVersion(threadID)
+		b.sendVersion(0)
 		return
 	case text == "/status":
-		b.sendStatus(threadID)
+		b.sendStatus(0)
 		return
 	case text == "/prs":
-		b.sendPRs(threadID)
+		b.sendPRs(0)
 		return
 	case text == "/tasks":
-		b.sendTasks(threadID)
+		b.sendTasks(0)
 		return
 	case text == "/reminders":
-		b.sendReminders(threadID)
+		b.sendReminders(0)
 		return
 	case strings.HasPrefix(text, "/repo "):
-		b.setRepo(strings.TrimPrefix(text, "/repo "), threadID)
+		b.setRepo(strings.TrimPrefix(text, "/repo "), 0)
 		return
 	case strings.HasPrefix(text, "/remind "):
-		b.addReminder(strings.TrimPrefix(text, "/remind "), threadID)
+		b.addReminder(strings.TrimPrefix(text, "/remind "), 0)
 		return
 	case strings.HasPrefix(text, "/cancel "):
-		b.cancelTask(strings.TrimPrefix(text, "/cancel "), threadID)
+		b.cancelTask(strings.TrimPrefix(text, "/cancel "), 0)
 		return
 	}
 
-	// Сначала проверяем на задачу - это позволит использовать Agent со всеми тулами
-	if looksLikeTask(lower) {
-		b.runCodingTask(text, threadID)
-		return
-	}
-
-	// Напоминания
+	// Напоминания (быстрая проверка)
 	if looksLikeReminder(lower) {
-		b.handleReminderNLP(text, threadID)
+		b.handleReminderNLP(text, 0)
 		return
 	}
 
-	// Остальное - обычный чат
-	b.chat(text, threadID)
+	// Все остальное - пусть LLM решает что делать
+	b.handleUserMessage(text)
 }
 
+// looksLikeTask - простая эвристика для CLI режима (в боте LLM сам решает)
 func looksLikeTask(lower string) bool {
 	taskKeywords := []string{
 		"добавь", "сделай", "создай", "напиши", "исправь", "fix", "add", "create",
@@ -213,26 +208,11 @@ func looksLikeTask(lower string) bool {
 		"покрой тестами",
 	}
 
-	// Ключевые слова для запросов, требующих тулы
-	toolKeywords := []string{
-		"мои репо", "my repos", "активные проект", "active project",
-		"топик", "topic", "аватарк", "avatar",
-		"список репо", "list repos", "github репо",
-		"по каким проект", "what projects", "работа идет",
-	}
-
 	for _, kw := range taskKeywords {
 		if strings.Contains(lower, kw) {
 			return true
 		}
 	}
-
-	for _, kw := range toolKeywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -247,9 +227,50 @@ func looksLikeReminder(lower string) bool {
 
 // ── Chat ──────────────────────────────────────────────────────
 
+// handleUserMessage - главный обработчик сообщений, LLM решает что делать
+func (b *Bot) handleUserMessage(text string) {
+	phID := b.tg("🤔 _анализирую..._", 0)
+	log.Printf("handleUserMessage: text=%q", truncate(text, 100))
+
+	o, r := b.currentRepo()
+
+	// Спрашиваем LLM что это за тип сообщения
+	routerPrompt := fmt.Sprintf(`Ты AI-ассистент разработчика Никиты. Репо: %s/%s.
+
+Проанализируй сообщение пользователя и определи тип:
+- "task" - если это задача по кодингу (добавить фичу, исправить баг, рефакторинг, деплой)
+- "chat" - если это вопрос, обычный разговор, просьба объяснить что-то
+
+Сообщение: %s
+
+Ответь ОДНИМ словом: task или chat`, o, r, text)
+
+	msgType, err := b.callHaiku("", routerPrompt)
+	if err != nil {
+		log.Printf("handleUserMessage: router error - %v, defaulting to chat", err)
+		msgType = "chat"
+	}
+
+	msgType = strings.ToLower(strings.TrimSpace(msgType))
+	log.Printf("handleUserMessage: type=%s", msgType)
+
+	if strings.Contains(msgType, "task") {
+		// Это задача - запускаем агента
+		b.edit(phID, "") // убираем "анализирую"
+		b.runCodingTask(text, 0)
+	} else {
+		// Обычный чат - отвечаем со streaming
+		b.chatWithStreaming(text, phID)
+	}
+}
+
 func (b *Bot) chat(text string, threadID int) {
 	phID := b.tg("🤔 _анализирую вопрос..._", threadID)
-	log.Printf("chat: msgID=%d threadID=%d text=%q", phID, threadID, text)
+	b.chatWithStreaming(text, phID)
+}
+
+func (b *Bot) chatWithStreaming(text string, phID int) {
+	log.Printf("chat: msgID=%d text=%q", phID, truncate(text, 100))
 
 	o, r := b.currentRepo()
 	system := fmt.Sprintf(
@@ -272,7 +293,7 @@ func (b *Bot) chat(text string, threadID int) {
 
 	// Голосовое сообщение для длинных ответов (> 300 символов)
 	if b.cfg.OpenAIKey != "" && len(full) > 300 {
-		go b.sendVoice(removeMarkdown(truncate(full, 500)), threadID)
+		go b.sendVoice(removeMarkdown(truncate(full, 500)), 0)
 	}
 }
 
@@ -344,12 +365,8 @@ func (b *Bot) handleDirectAction(act *directAction, threadID int) {
 func (b *Bot) runCodingTask(description string, _ int) {
 	o, r := b.currentRepo()
 
-	// Определяем тред для этого репо
-	taskThreadID := b.topics.GetOrCreate(o, r)
-	// Если не форум-группа (GetOrCreate вернул 0) — пишем в основной чат
-	if taskThreadID == 0 {
-		taskThreadID = 0
-	}
+	// Все сообщения в основной чат (без топиков/тредов)
+	taskThreadID := 0
 
 	taskID := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	task := &Task{
