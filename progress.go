@@ -110,15 +110,32 @@ func (pt *ProgressTracker) render() string {
 	if est := pt.estimateRemaining(); est > 0 && !pt.done_ {
 		sb.WriteString(fmt.Sprintf(" • ест. ещё ~%s", fmtDuration(est)))
 	}
-	sb.WriteString("\n\n")
+	sb.WriteString("\n")
+
+	// Общий прогресс-бар
+	totalSteps := len(pt.done) + len(pt.pending)
+	if pt.current != nil {
+		totalSteps++
+	}
+	if totalSteps > 0 {
+		progress := float64(len(pt.done)) / float64(totalSteps)
+		sb.WriteString(renderProgressBar(progress, 10))
+		sb.WriteString(fmt.Sprintf(" (%d/%d)\n", len(pt.done), totalSteps))
+	}
+
+	sb.WriteString("\n")
 
 	// Завершённые шаги
 	for _, step := range pt.done {
-		icon := "✅"
+		statusIcon := "✅"
 		if step.err {
-			icon = "❌"
+			statusIcon = "❌"
 		}
-		sb.WriteString(fmt.Sprintf("%s `%s` _%s_\n", icon, step.label, fmtDuration(step.duration)))
+		toolIcon := step.icon
+		if toolIcon == "" {
+			toolIcon = "⚙️"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s `%s` _%s_\n", statusIcon, toolIcon, step.label, fmtDuration(step.duration)))
 	}
 
 	// Текущий шаг (анимированный)
@@ -127,7 +144,11 @@ func (pt *ProgressTracker) render() string {
 		running := time.Since(pt.started.Add(-elapsed)).Round(time.Second)
 		_ = running
 		stepElapsed := time.Since(pt.started) - totalDone(pt.done)
-		sb.WriteString(fmt.Sprintf("%s `%s` _(%s)_\n", spinner, pt.current.label,
+		toolIcon := pt.current.icon
+		if toolIcon == "" {
+			toolIcon = "⚙️"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s `%s` _(%s)_\n", spinner, toolIcon, pt.current.label,
 			fmtDuration(stepElapsed.Round(time.Second))))
 	}
 
@@ -167,7 +188,8 @@ func (pt *ProgressTracker) StartStep(tool, arg string) {
 	if arg != "" {
 		label += "(" + truncate(arg, 30) + ")"
 	}
-	pt.current = &progressStep{label: label}
+	icon := getToolIcon(tool)
+	pt.current = &progressStep{icon: icon, label: label}
 
 	// Убираем из pending если есть
 	for i, p := range pt.pending {
@@ -275,4 +297,40 @@ func totalDone(steps []progressStep) time.Duration {
 		total += s.duration
 	}
 	return total
+}
+
+// renderProgressBar — визуальный прогресс-бар с эмоджи
+// progress: 0.0 - 1.0 (например, 0.7 = 70%)
+// width: количество блоков (обычно 10)
+func renderProgressBar(progress float64, width int) string {
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	filled := int(progress * float64(width))
+	empty := width - filled
+
+	bar := strings.Repeat("▓", filled) + strings.Repeat("░", empty)
+	percentage := int(progress * 100)
+	return fmt.Sprintf("%s %d%%", bar, percentage)
+}
+
+// getToolIcon — иконки для разных типов тулов
+func getToolIcon(tool string) string {
+	icons := map[string]string{
+		"read_file":      "📖",
+		"write_file":     "✏️",
+		"list_files":     "📁",
+		"search_code":    "🔍",
+		"spawn_subagent": "🤖",
+		"orchestrate":    "🎯",
+		"create_pr":      "🚀",
+		"done":           "✅",
+	}
+	if icon, ok := icons[tool]; ok {
+		return icon
+	}
+	return "⚙️" // дефолтная иконка
 }

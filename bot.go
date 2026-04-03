@@ -205,7 +205,7 @@ func looksLikeReminder(lower string) bool {
 // ── Chat ──────────────────────────────────────────────────────
 
 func (b *Bot) chat(text string, threadID int) {
-	phID := b.tg("💭 _думаю..._", threadID)
+	phID := b.tg("🤔 _анализирую вопрос..._", threadID)
 	o, r := b.currentRepo()
 	system := fmt.Sprintf(
 		`Ты AI-ассистент разработчика Никиты. Репо: %s/%s. Отвечай кратко на русском.`, o, r)
@@ -298,7 +298,8 @@ func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 	for step := range task.Steps {
 		switch step.Type {
 		case StepThought:
-			text := "💭 _" + truncate(step.Content, 300) + "_"
+			// Улучшенный формат мыслей с иконкой лампочки
+			text := "💡 _" + truncate(step.Content, 300) + "_"
 			if thoughtMsgID == 0 {
 				thoughtMsgID = b.tg(text, threadID)
 			} else {
@@ -307,7 +308,8 @@ func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 
 		case StepAction:
 			if thoughtMsgID != 0 {
-				b.edit(thoughtMsgID, "⚙️ _"+truncate(step.Content, 300)+"_")
+				// Визуально отличаем действие от мысли
+				b.edit(thoughtMsgID, "⚡ _"+truncate(step.Content, 300)+"_")
 			}
 
 		case StepPR:
