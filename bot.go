@@ -233,18 +233,57 @@ func looksLikeReminder(lower string) bool {
 
 // handleUserMessage - главный обработчик сообщений
 func (b *Bot) handleUserMessage(text string) {
-	lower := strings.ToLower(text)
+	// Используем LLM роутер для определения намерения
+	log.Printf("handleUserMessage: routing text=%q", truncate(text, 100))
 
-	// Простая эвристика для задач
-	if looksLikeTask(lower) {
-		log.Printf("handleUserMessage: detected task, running agent")
-		b.runCodingTask(text, 0)
+	intent, err := b.RouteRequest(text)
+	if err != nil {
+		log.Printf("handleUserMessage: router error - %v, fallback to chat", err)
+		// Fallback на обычный чат при ошибке роутера
+		b.handleChat(text)
 		return
 	}
 
-	// Обычный чат
+	log.Printf("handleUserMessage: intent=%s, params=%v", intent.Type, intent.Params)
+
+	switch intent.Type {
+	case "list_prs":
+		b.handleListPRs(0)
+	case "merge_pr":
+		prNum := extractPRNumber(text)
+		if num, ok := intent.Params["pr_number"]; ok && prNum == 0 {
+			fmt.Sscanf(num, "%d", &prNum)
+		}
+		if prNum == 0 {
+			b.tg("❌ Не могу определить номер PR. Попробуй: 'смержи PR #5' или 'смержи пятый PR'", 0)
+			return
+		}
+		b.handleMergePR(prNum, 0)
+	case "close_pr":
+		prNum := extractPRNumber(text)
+		if num, ok := intent.Params["pr_number"]; ok && prNum == 0 {
+			fmt.Sscanf(num, "%d", &prNum)
+		}
+		if prNum == 0 {
+			b.tg("❌ Не могу определить номер PR. Попробуй: 'закрой PR #5' или 'закрой пятый PR'", 0)
+			return
+		}
+		b.handleClosePR(prNum, 0)
+	case "coding_task":
+		log.Printf("handleUserMessage: coding task detected")
+		b.runCodingTask(text, 0)
+	case "chat":
+		b.handleChat(text)
+	default:
+		log.Printf("handleUserMessage: unknown intent type=%s, fallback to chat", intent.Type)
+		b.handleChat(text)
+	}
+}
+
+// handleChat - обычный чат с ассистентом
+func (b *Bot) handleChat(text string) {
 	phID := b.tg("💭", 0)
-	log.Printf("handleUserMessage: chat mode, text=%q", truncate(text, 100))
+	log.Printf("handleChat: text=%q", truncate(text, 100))
 
 	o, r := b.currentRepo()
 	system := fmt.Sprintf(`Ты AI-ассистент разработчика Никиты. Репо: %s/%s. Отвечай кратко и по-дружески на русском.`, o, r)
@@ -261,13 +300,13 @@ func (b *Bot) handleUserMessage(text string) {
 			b.edit(phID, partial+" ▌")
 		})
 		if err != nil {
-			log.Printf("handleUserMessage: stream error - %v", err)
+			log.Printf("handleChat: stream error - %v", err)
 			// Показываем красивую ошибку
 			errMsg := b.formatLLMError(err)
 			b.edit(phID, errMsg)
 			return
 		}
-		log.Printf("handleUserMessage: stream success, length=%d", len(full))
+		log.Printf("handleChat: stream success, length=%d", len(full))
 		b.edit(phID, full)
 
 		// Голосовое сообщение для длинных ответов
@@ -745,6 +784,11 @@ func (b *Bot) sendVersion(threadID int) {
 }
 
 func (b *Bot) sendPRs(threadID int) {
+	b.handleListPRs(threadID)
+}
+
+// handleListPRs - показывает список открытых PR с кнопками
+func (b *Bot) handleListPRs(threadID int) {
 	o, r := b.currentRepo()
 	prs, err := NewGitHubClient(b.cfg.GitHubToken, o, r).ListPRs()
 	if err != nil {
@@ -755,12 +799,114 @@ func (b *Bot) sendPRs(threadID int) {
 		b.tg("🟢 Нет открытых PR", threadID)
 		return
 	}
+
 	var sb strings.Builder
-	sb.WriteString("📋 *Open PRs:*\n")
-	for _, pr := range prs {
-		sb.WriteString(fmt.Sprintf("• [#%d %s](%s)\n", pr.Number, pr.Title, pr.URL))
+	sb.WriteString(fmt.Sprintf("📋 *Открытые PR для %s/%s:*\n\n", o, r))
+	for i, pr := range prs {
+		sb.WriteString(fmt.Sprintf("%d. [#%d](%s) - %s\n", i+1, pr.Number, pr.URL, pr.Title))
 	}
-	b.tg(sb.String(), threadID)
+
+	// Создаем кнопки для каждого PR (по 2 кнопки в ряд)
+	var keyboard [][]map[string]any
+	for _, pr := range prs {
+		row := []map[string]any{
+			{"text": fmt.Sprintf("✅ Merge #%d", pr.Number), "callback_data": fmt.Sprintf("merge:%d", pr.Number)},
+			{"text": fmt.Sprintf("❌ Close #%d", pr.Number), "callback_data": fmt.Sprintf("close:%d", pr.Number)},
+		}
+		keyboard = append(keyboard, row)
+	}
+
+	b.sendWithButtons(sb.String(), keyboard, threadID)
+}
+
+// handleMergePR - мерджит указанный PR с подтверждением
+func (b *Bot) handleMergePR(prNum int, threadID int) {
+	o, r := b.currentRepo()
+	gh := NewGitHubClient(b.cfg.GitHubToken, o, r)
+
+	// Проверяем что PR существует
+	prs, err := gh.ListPRs()
+	if err != nil {
+		b.tg("❌ "+err.Error(), threadID)
+		return
+	}
+
+	found := false
+	var prTitle string
+	for _, pr := range prs {
+		if pr.Number == prNum {
+			found = true
+			prTitle = pr.Title
+			break
+		}
+	}
+
+	if !found {
+		b.tg(fmt.Sprintf("❌ PR #%d не найден среди открытых PR", prNum), threadID)
+		return
+	}
+
+	// Подтверждение с кнопками
+	msg := fmt.Sprintf("🔀 Смержить PR #%d?\n\n*%s*", prNum, prTitle)
+	taskID := fmt.Sprintf("merge-pr-%d-%d", prNum, time.Now().Unix())
+
+	if !b.requestApproval(taskID, msg, threadID) {
+		b.tg("⏸ Мерж отменен", threadID)
+		return
+	}
+
+	// Мерджим
+	if err := gh.MergePR(prNum); err != nil {
+		b.tg(fmt.Sprintf("❌ Ошибка мерджа: %v", err), threadID)
+		return
+	}
+
+	b.tg(fmt.Sprintf("✅ PR #%d смержен!\n\n_%s_", prNum, prTitle), threadID)
+}
+
+// handleClosePR - закрывает PR без мерджа
+func (b *Bot) handleClosePR(prNum int, threadID int) {
+	o, r := b.currentRepo()
+	gh := NewGitHubClient(b.cfg.GitHubToken, o, r)
+
+	// Проверяем что PR существует
+	prs, err := gh.ListPRs()
+	if err != nil {
+		b.tg("❌ "+err.Error(), threadID)
+		return
+	}
+
+	found := false
+	var prTitle string
+	for _, pr := range prs {
+		if pr.Number == prNum {
+			found = true
+			prTitle = pr.Title
+			break
+		}
+	}
+
+	if !found {
+		b.tg(fmt.Sprintf("❌ PR #%d не найден среди открытых PR", prNum), threadID)
+		return
+	}
+
+	// Подтверждение
+	msg := fmt.Sprintf("🗑 Закрыть PR #%d без мерджа?\n\n*%s*", prNum, prTitle)
+	taskID := fmt.Sprintf("close-pr-%d-%d", prNum, time.Now().Unix())
+
+	if !b.requestApproval(taskID, msg, threadID) {
+		b.tg("⏸ Закрытие отменено", threadID)
+		return
+	}
+
+	// Закрываем
+	if err := gh.ClosePR(prNum); err != nil {
+		b.tg(fmt.Sprintf("❌ Ошибка закрытия: %v", err), threadID)
+		return
+	}
+
+	b.tg(fmt.Sprintf("🗑 PR #%d закрыт\n\n_%s_", prNum, prTitle), threadID)
 }
 
 func (b *Bot) sendTasks(threadID int) {
@@ -800,11 +946,12 @@ func (b *Bot) handleCallback(q *tgbotapi.CallbackQuery) {
 		b.resolveApproval(strings.TrimPrefix(q.Data, "approve:"), true)
 	case strings.HasPrefix(q.Data, "reject:"):
 		b.resolveApproval(strings.TrimPrefix(q.Data, "reject:"), false)
+	case strings.HasPrefix(q.Data, "merge:"):
+		n, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "merge:"))
+		go b.handleMergePR(n, 0)
 	case strings.HasPrefix(q.Data, "close:"):
 		n, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "close:"))
-		o, r := b.currentRepo()
-		NewGitHubClient(b.cfg.GitHubToken, o, r).ClosePR(n)
-		b.tg(fmt.Sprintf("🗑 PR #%d закрыт", n), 0)
+		go b.handleClosePR(n, 0)
 	}
 }
 
