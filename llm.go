@@ -284,6 +284,7 @@ func (c *LLMClient) RouteIntent(text, owner, repo string) (string, error) {
 
 Classify user intent into ONE of:
 - "list_prs" - show pull requests
+- "list_repos" - list user repositories (queries like "my repos", "what repos", "list repositories")
 - "merge_pr" - merge specific PR
 - "close_pr" - close PR
 - "code" - any code changes/fixes/features

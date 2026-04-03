@@ -201,6 +201,18 @@ func (b *Bot) route(text string, threadID int) {
 	switch {
 	case strings.Contains(intent, "list_prs"):
 		b.listPRs(threadID)
+	case strings.Contains(intent, "list_repos"):
+		// Пытаемся извлечь username из текста, иначе используем текущий owner
+		username := o
+		// Простой парсинг для "какие у меня" -> текущий owner, "какие у USER" -> USER
+		words := strings.Fields(strings.ToLower(text))
+		for i, word := range words {
+			if (word == "у" || word == "for" || word == "пользователя") && i+1 < len(words) {
+				username = words[i+1]
+				break
+			}
+		}
+		b.listRepos(username, threadID)
 	case strings.Contains(intent, "merge_pr"):
 		prNum := extractPRNumber(text)
 		if prNum == 0 {
@@ -487,7 +499,8 @@ func (b *Bot) listRepos(username string, threadID int) {
 		b.tg("❌ "+err.Error(), threadID)
 		return
 	}
-	b.tg(result, threadID)
+	// Отправляем без markdown чтобы избежать ошибок парсинга
+	b.tgPlain(result, threadID)
 }
 
 func (b *Bot) closePR(prNum int, threadID int) {
@@ -641,6 +654,18 @@ func (b *Bot) removeTask(id string) {
 func (b *Bot) tg(text string, threadID int) int {
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+	// TODO: add threadID support via raw API
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("send error: %v", err)
+		return 0
+	}
+	return sent.MessageID
+}
+
+func (b *Bot) tgPlain(text string, threadID int) int {
+	msg := tgbotapi.NewMessage(b.chatID, text)
 	msg.DisableWebPagePreview = true
 	// TODO: add threadID support via raw API
 	sent, err := b.api.Send(msg)
