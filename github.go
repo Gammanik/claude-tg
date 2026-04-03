@@ -337,3 +337,46 @@ func (c *GitHubClient) do(req *http.Request, out any) error {
 	}
 	return nil
 }
+
+// GetUserRepos - получает список активных репозиториев пользователя
+func (c *GitHubClient) GetUserRepos(username string) (string, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/users/%s/repos?sort=updated&per_page=20", username), nil)
+	if err != nil {
+		return "", err
+	}
+
+	var repos []struct {
+		Name        string    `json:"name"`
+		FullName    string    `json:"full_name"`
+		Description string    `json:"description"`
+		Language    string    `json:"language"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Private     bool      `json:"private"`
+	}
+
+	if err := c.do(req, &repos); err != nil {
+		return "", err
+	}
+
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("Активные репозитории %s (%d):\n\n", username, len(repos)))
+
+	for i, repo := range repos {
+		visibility := "public"
+		if repo.Private {
+			visibility = "private"
+		}
+		lang := repo.Language
+		if lang == "" {
+			lang = "—"
+		}
+		result.WriteString(fmt.Sprintf("%d. %s (%s, %s)\n   Обновлен: %s\n",
+			i+1, repo.FullName, visibility, lang, repo.UpdatedAt.Format("02.01.2006")))
+		if repo.Description != "" {
+			result.WriteString(fmt.Sprintf("   %s\n", repo.Description))
+		}
+		result.WriteString("\n")
+	}
+
+	return result.String(), nil
+}

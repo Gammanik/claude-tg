@@ -112,6 +112,53 @@ func (tm *TopicManager) editTopicName(threadID int, name string) {
 	http.Post(url, "application/json", bytes.NewReader(body))
 }
 
+// DeleteTopic — удаляет топик по имени (owner/repo)
+func (tm *TopicManager) DeleteTopic(name string) error {
+	tm.mu.Lock()
+	threadID, ok := tm.topics[name]
+	if !ok {
+		tm.mu.Unlock()
+		return fmt.Errorf("топик '%s' не найден", name)
+	}
+	delete(tm.topics, name)
+	tm.mu.Unlock()
+
+	// Закрываем топик в Telegram
+	payload := map[string]any{
+		"chat_id":           tm.chatID,
+		"message_thread_id": threadID,
+	}
+	body, _ := json.Marshal(payload)
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/closeForumTopic", tm.token)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if !result.OK {
+		return fmt.Errorf("closeForumTopic: %s", result.Description)
+	}
+	return nil
+}
+
+// GetAllTopics — возвращает список всех топиков
+func (tm *TopicManager) GetAllTopics() []string {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	topics := make([]string, 0, len(tm.topics))
+	for name := range tm.topics {
+		topics = append(topics, name)
+	}
+	return topics
+}
+
 func repoEmoji(repo string) string {
 	switch repo {
 	case "PeerPack", "peerpack":

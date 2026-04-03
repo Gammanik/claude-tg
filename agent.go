@@ -350,6 +350,46 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 		}
 		return strings.Join(parts, "\n"), 0, "", false, ""
 
+	case "get_user_repos":
+		username := act.Args["username"]
+		if username == "" {
+			username = a.owner
+		}
+		repos, err := a.gh.GetUserRepos(username)
+		if err != nil {
+			return "", 0, "", false, err.Error()
+		}
+		return repos, 0, "", false, ""
+
+	case "set_avatar":
+		if a.bot == nil {
+			return "", 0, "", false, "Бот недоступен"
+		}
+		if err := a.bot.setBotAvatar(); err != nil {
+			return "", 0, "", false, err.Error()
+		}
+		return "Аватарка обновлена успешно", 0, "", false, ""
+
+	case "manage_topics":
+		if a.bot == nil {
+			return "", 0, "", false, "Бот недоступен"
+		}
+		action := act.Args["action"] // "create" или "delete"
+		topicName := act.Args["name"]
+
+		if action == "delete" {
+			if err := a.bot.topics.DeleteTopic(topicName); err != nil {
+				return "", 0, "", false, err.Error()
+			}
+			return fmt.Sprintf("Топик '%s' удален", topicName), 0, "", false, ""
+		} else if action == "create" {
+			owner := act.Args["owner"]
+			repo := act.Args["repo"]
+			threadID := a.bot.topics.GetOrCreate(owner, repo)
+			return fmt.Sprintf("Топик '%s/%s' создан (ID: %d)", owner, repo, threadID), 0, "", false, ""
+		}
+		return "", 0, "", false, "Неизвестное действие: " + action
+
 	case "create_pr":
 		if a.bot != nil {
 			msg := fmt.Sprintf("🔀 Создать PR?\n*%s*", act.Args["title"])
@@ -653,6 +693,28 @@ task: "Write Playwright test for TrackingScreen"
 <action>
 tool: "orchestrate"
 tasks: "Write unit tests for AuthService\nWrite integration test for login flow\nUpdate API docs"
+</action>
+
+<action>
+tool: "get_user_repos"
+username: "Gammanik"
+</action>
+
+<action>
+tool: "set_avatar"
+</action>
+
+<action>
+tool: "manage_topics"
+action: "create"
+owner: "Gammanik"
+repo: "peerpack-bot"
+</action>
+
+<action>
+tool: "manage_topics"
+action: "delete"
+name: "owner/old-repo"
 </action>
 
 <action>

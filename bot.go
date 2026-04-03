@@ -180,18 +180,19 @@ func (b *Bot) route(text string, threadID int) {
 		return
 	}
 
-	if act := detectDirectAction(text); act != nil {
-		b.handleDirectAction(act, threadID)
-		return
-	}
-	if looksLikeReminder(lower) {
-		b.handleReminderNLP(text, threadID)
-		return
-	}
+	// Сначала проверяем на задачу - это позволит использовать Agent со всеми тулами
 	if looksLikeTask(lower) {
 		b.runCodingTask(text, threadID)
 		return
 	}
+
+	// Напоминания
+	if looksLikeReminder(lower) {
+		b.handleReminderNLP(text, threadID)
+		return
+	}
+
+	// Остальное - обычный чат
 	b.chat(text, threadID)
 }
 
@@ -729,6 +730,9 @@ func formatToolCall(toolCall string) string {
 		"search_code":    "🔍",
 		"search_history": "🔎",
 		"get_summary":    "📋",
+		"get_user_repos": "📂",
+		"set_avatar":     "🎨",
+		"manage_topics":  "📌",
 		"spawn_subagent": "🤖",
 		"orchestrate":    "🎯",
 		"create_pr":      "🚀",
