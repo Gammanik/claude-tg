@@ -16,12 +16,13 @@ import (
 type StepType string
 
 const (
-	StepThought StepType = "thought"
-	StepAction  StepType = "action"
-	StepResult  StepType = "result" // результат выполнения тула
-	StepPR      StepType = "pr"
-	StepError   StepType = "error"
-	StepDone    StepType = "done"
+	StepThought  StepType = "thought"
+	StepPlanning StepType = "planning" // мысли планировщика (Extended Thinking)
+	StepAction   StepType = "action"
+	StepResult   StepType = "result" // результат выполнения тула
+	StepPR       StepType = "pr"
+	StepError    StepType = "error"
+	StepDone     StepType = "done"
 )
 
 type Step struct {
@@ -75,8 +76,37 @@ func (a *Agent) Run(task *Task) {
 	}()
 	defer close(task.Steps)
 
-	a.think("Читаю структуру репо...", task)
+	// ФАЗА 1: ПЛАНИРОВАНИЕ
+	a.think("Анализирую задачу и создаю план...", task)
+
+	// Трекер для планирования
+	if a.progress != nil {
+		a.progress.StartPlanning()
+	}
+
 	ctx := a.buildContext(task.Description)
+	planner := NewPlanner(a.cfg, a.owner, a.repo, a.bot)
+
+	plan, err := planner.CreatePlan(task, ctx, func(thinking string) {
+		// Streaming thinking от планировщика
+		task.Steps <- Step{Type: StepPlanning, Content: thinking}
+	})
+
+	if err != nil {
+		task.Steps <- Step{Type: StepError, Content: "Planning failed: " + err.Error()}
+		if a.progress != nil {
+			a.progress.Error("Planning failed: " + err.Error())
+		}
+		return
+	}
+
+	// Завершаем планирование в трекере
+	if a.progress != nil {
+		a.progress.FinishPlanning(plan)
+	}
+
+	// Показываем финальный план
+	task.Steps <- Step{Type: StepThought, Content: plan.Format()}
 
 	// Создаём ветку
 	branch := makeBranch(task.Description, task.ID)
@@ -96,35 +126,64 @@ func (a *Agent) Run(task *Task) {
 		a.progress.SetBranch(branch)
 	}
 
-	// ReAct loop
+	// ФАЗА 2: ВЫПОЛНЕНИЕ С ПЛАНОМ
+	err = a.ExecuteWithPlan(task, plan, branch)
+	if err != nil {
+		// ФАЗА 3: ПЕРЕPLANИРОВАНИЕ (максимум 2 попытки)
+		for attempt := 0; attempt < 2; attempt++ {
+			a.think(fmt.Sprintf("Произошла ошибка, переplanирую (попытка %d/2)...", attempt+1), task)
+			newPlan, replanErr := planner.Replan(task, plan, err.Error())
+			if replanErr != nil {
+				task.Steps <- Step{Type: StepError, Content: "Replan failed: " + replanErr.Error()}
+				if a.progress != nil {
+					a.progress.Error("Replan failed: " + replanErr.Error())
+				}
+				return
+			}
+
+			// Показываем новый план
+			task.Steps <- Step{Type: StepThought, Content: "New plan:\n" + newPlan.Format()}
+
+			// Пробуем выполнить новый план
+			err = a.ExecuteWithPlan(task, newPlan, branch)
+			if err == nil {
+				return // успех
+			}
+		}
+
+		// Если все попытки replan исчерпаны
+		task.Steps <- Step{Type: StepError, Content: "Failed after replanning: " + err.Error()}
+		if a.progress != nil {
+			a.progress.Error("Failed after replanning")
+		}
+	}
+}
+
+// ExecuteWithPlan выполняет план используя ReAct loop с guidance от плана
+func (a *Agent) ExecuteWithPlan(task *Task, plan *TaskPlan, branch string) error {
 	messages := []msg{
-		{Role: "system", Content: systemPrompt(a.owner, a.repo, ctx)},
+		{Role: "system", Content: systemPromptWithPlan(a.owner, a.repo, plan)},
 		{Role: "user", Content: task.Description},
 	}
+
+	currentPhase := 0
 
 	for i := 0; i < 25; i++ {
 		// Проверяем лимиты перед вызовом
 		if a.bot != nil && a.bot.limits != nil {
-			// Оцениваем ожидаемое использование (примерно 1000 токенов на запрос)
 			estimatedTokens := 1000
 			ok, warning := a.bot.limits.CheckLimit(estimatedTokens)
 			if !ok {
-				task.Steps <- Step{Type: StepError, Content: warning}
-				if a.progress != nil {
-					a.progress.Error(warning)
-				}
-				return
+				return fmt.Errorf("usage limit exceeded: %s", warning)
 			}
 			if warning != "" {
-				// Показываем предупреждение но продолжаем
 				task.Steps <- Step{Type: StepThought, Content: warning}
 			}
 		}
 
 		resp, err := a.llm(messages)
 		if err != nil {
-			task.Steps <- Step{Type: StepError, Content: "LLM: " + err.Error()}
-			return
+			return fmt.Errorf("LLM error: %w", err)
 		}
 		messages = append(messages, msg{Role: "assistant", Content: resp})
 
@@ -147,7 +206,12 @@ func (a *Agent) Run(task *Task) {
 			if a.progress != nil {
 				a.progress.Finish()
 			}
-			return
+			return nil
+		}
+
+		// Проверяем соответствие плану
+		if !plan.ValidateActions(currentPhase, actions) {
+			a.think("Actions не полностью соответствуют плану, но продолжаю выполнение...", task)
 		}
 
 		// Выполняем actions параллельно с учетом зависимостей
@@ -158,20 +222,22 @@ func (a *Agent) Run(task *Task) {
 			if a.progress != nil {
 				a.progress.SetPR(prNum, prURL)
 			}
-			return
+			return nil
 		}
 		if done {
 			task.Steps <- Step{Type: StepDone, Content: results}
 			if a.progress != nil {
 				a.progress.Finish()
 			}
-			return
+			return nil
 		}
 
 		// Собираем результаты для передачи в LLM
 		messages = append(messages, msg{Role: "user", Content: "Tool results:\n" + results})
+		currentPhase++
 	}
-	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов"}
+
+	return fmt.Errorf("превышен лимит шагов (25)")
 }
 
 func (a *Agent) think(content string, task *Task) {
@@ -451,6 +517,15 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 	case "set_avatar":
 		if a.bot == nil {
 			return "", 0, "", false, "Бот недоступен"
+		}
+		// Проверяем наличие OpenAI ключа, запрашиваем если нужно
+		if a.bot.apiKeys != nil && !a.bot.apiKeys.HasKey("openai") {
+			key, err := a.bot.apiKeys.RequestKey("openai", a.threadID)
+			if err != nil {
+				return "", 0, "", false, "API key required: " + err.Error()
+			}
+			// Обновляем конфиг
+			a.bot.cfg.OpenAIKey = key
 		}
 		if err := a.bot.setBotAvatar(); err != nil {
 			return "", 0, "", false, err.Error()
@@ -838,4 +913,104 @@ Example:
   read_file(A) then write_file(A, ...) → sequential (dependency)
 
 Always provide time estimates for planning.`, owner, repo, ctx)
+}
+
+func systemPromptWithPlan(owner, repo string, plan *TaskPlan) string {
+	return fmt.Sprintf(`You are an AI coding agent for %s/%s.
+
+## Execution Plan (follow this):
+%s
+
+Your task is to execute this plan step by step. Use the tools below.
+If you encounter errors, report them immediately.
+
+## Available Tools
+
+<action>
+tool: "read_file"
+path: "src/components/Example.jsx"
+</action>
+
+<action>
+tool: "write_file"
+path: "src/components/New.jsx"
+content: "import React from 'react';\nexport default function New() { return <div/>; }"
+message: "feat: add New component"
+</action>
+
+<action>
+tool: "list_files"
+path: "src"
+</action>
+
+<action>
+tool: "search_code"
+query: "useUserData"
+</action>
+
+<action>
+tool: "search_history"
+query: "bug fix"
+thread_id: "123"
+</action>
+
+<action>
+tool: "get_summary"
+thread_id: "123"
+count: "20"
+</action>
+
+<action>
+tool: "spawn_subagent"
+task: "Write Playwright test for TrackingScreen"
+</action>
+
+<action>
+tool: "orchestrate"
+tasks: "Write unit tests for AuthService\nWrite integration test for login flow\nUpdate API docs"
+</action>
+
+<action>
+tool: "get_user_repos"
+username: "Gammanik"
+</action>
+
+<action>
+tool: "set_avatar"
+</action>
+
+<action>
+tool: "manage_topics"
+action: "create"
+owner: "Gammanik"
+repo: "peerpack-bot"
+</action>
+
+<action>
+tool: "manage_topics"
+action: "delete"
+name: "owner/old-repo"
+</action>
+
+<action>
+tool: "create_pr"
+title: "feat: add tracking screen"
+body: "## Changes\n- TrackingScreen.jsx\n- useTracking.ts\n- e2e test"
+</action>
+
+<action>
+tool: "done"
+summary: "Analysis complete"
+</action>
+
+## Execution Rules
+1. Follow the plan phases in order
+2. Report any deviations or errors immediately
+3. Write Thought: before each action to explain your progress
+4. Use the exact tools specified in the plan
+5. After completing all phases → create_pr or done
+
+## Important
+The plan is a guide. If you discover issues during execution, report them.
+The system will replan automatically if needed.`, owner, repo, plan.Format())
 }

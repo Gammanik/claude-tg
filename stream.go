@@ -142,6 +142,105 @@ func (b *Bot) callClaudeOnce(system, userText string) (string, error) {
 	return "", fmt.Errorf("пустой ответ от Claude")
 }
 
+// streamClaudeWithThinking — streaming с Extended Thinking для планировщика
+// Возвращает content, thinking и error
+func (b *Bot) streamClaudeWithThinking(system, userText string, onThinking func(string), onContent func(string)) (string, string, error) {
+	log.Printf("streamClaudeWithThinking: start")
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      "claude-opus-4-5-20251101",
+		"max_tokens": 16384,
+		"stream":     true,
+		"thinking": map[string]any{
+			"type":          "enabled",
+			"budget_tokens": 10000,
+		},
+		"system":   system,
+		"messages": []map[string]string{{"role": "user", "content": userText}},
+	})
+
+	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	req.Header.Set("x-api-key", b.cfg.AnthropicKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("API %d: %s", resp.StatusCode, string(body))
+	}
+
+	var thinkingBuffer, contentBuffer strings.Builder
+	lastUpdate := time.Now()
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 128*1024), 128*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var ev struct {
+			Type         string `json:"type"`
+			ContentBlock struct {
+				Type string `json:"type"`
+			} `json:"content_block"`
+			Delta struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			continue
+		}
+
+		// Обрабатываем thinking_delta
+		if ev.Type == "content_block_delta" && ev.Delta.Type == "thinking_delta" && ev.Delta.Thinking != "" {
+			thinkingBuffer.WriteString(ev.Delta.Thinking)
+
+			// Обновляем каждые 400ms
+			if time.Since(lastUpdate) > 400*time.Millisecond {
+				if onThinking != nil {
+					onThinking(thinkingBuffer.String())
+				}
+				lastUpdate = time.Now()
+			}
+		}
+
+		// Обрабатываем text_delta
+		if ev.Type == "content_block_delta" && ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
+			contentBuffer.WriteString(ev.Delta.Text)
+
+			if time.Since(lastUpdate) > 400*time.Millisecond {
+				if onContent != nil {
+					onContent(contentBuffer.String())
+				}
+				lastUpdate = time.Now()
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return contentBuffer.String(), thinkingBuffer.String(), fmt.Errorf("scan: %w", err)
+	}
+
+	return contentBuffer.String(), thinkingBuffer.String(), nil
+}
+
 // callHaiku — дешёвый Claude Haiku для парсинга (напоминалки, роутинг)
 func (b *Bot) callHaiku(system, text string) (string, error) {
 	reqBody, _ := json.Marshal(map[string]any{

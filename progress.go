@@ -48,12 +48,14 @@ type progressStep struct {
 }
 
 var stepDurations = map[string]time.Duration{
+	"planning":       15 * time.Second, // Extended Thinking планирование
 	"read_file":      3 * time.Second,
 	"list_files":     2 * time.Second,
 	"write_file":     5 * time.Second,
 	"search_code":    4 * time.Second,
 	"spawn_subagent": 30 * time.Second,
 	"create_pr":      3 * time.Second,
+	"wait_ci":        20 * time.Second,
 }
 
 func NewProgressTracker(bot *Bot, taskDesc, owner, repo string, threadID int) *ProgressTracker {
@@ -277,6 +279,29 @@ func (pt *ProgressTracker) AddTokenUsage(input, output, cacheRead, cacheWrite in
 	}
 }
 
+func (pt *ProgressTracker) StartPlanning() {
+	pt.mu.Lock()
+	pt.current = &progressStep{icon: "🧠", label: "planning"}
+	pt.mu.Unlock()
+}
+
+func (pt *ProgressTracker) FinishPlanning(plan *TaskPlan) {
+	pt.mu.Lock()
+	if pt.current != nil {
+		elapsed := time.Since(pt.started) - totalDone(pt.done)
+		pt.current.duration = elapsed.Round(time.Second)
+		pt.done = append(pt.done, *pt.current)
+		pt.current = nil
+	}
+
+	// Добавляем predicted шаги из плана
+	if plan != nil {
+		pendingTools := plan.GetPendingTools()
+		pt.pending = append(pt.pending, pendingTools...)
+	}
+	pt.mu.Unlock()
+}
+
 func (pt *ProgressTracker) estimateRemaining() time.Duration {
 	var est time.Duration
 	for _, p := range pt.pending {
@@ -350,6 +375,7 @@ func renderProgressBar(progress float64, width int) string {
 // getToolIcon — иконки для разных типов тулов
 func getToolIcon(tool string) string {
 	icons := map[string]string{
+		"planning":       "🧠", // Extended Thinking
 		"read_file":      "📖",
 		"write_file":     "✏️",
 		"list_files":     "📁",
@@ -362,6 +388,7 @@ func getToolIcon(tool string) string {
 		"spawn_subagent": "🤖",
 		"orchestrate":    "🎯",
 		"create_pr":      "🚀",
+		"wait_ci":        "⏳",
 		"done":           "✅",
 	}
 	if icon, ok := icons[tool]; ok {

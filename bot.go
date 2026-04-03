@@ -24,6 +24,7 @@ type Bot struct {
 	cfg         Config
 	chatID      int64
 	topics      *TopicManager
+	apiKeys     *APIKeyManager // управление API ключами
 	repoMu      sync.RWMutex
 	owner, repo string
 	tasksMu     sync.Mutex
@@ -44,6 +45,7 @@ func NewBot(cfg Config) *Bot {
 		approvals: make(map[string]chan bool),
 	}
 	b.topics = NewTopicManager(cfg.TelegramToken, id)
+	b.apiKeys = NewAPIKeyManager(b)
 	return b
 }
 
@@ -373,6 +375,15 @@ func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 
 	for step := range task.Steps {
 		switch step.Type {
+		case StepPlanning:
+			// Стриминг мыслей планировщика (Extended Thinking)
+			text := "🧠 _" + truncate(step.Content, 400) + "_"
+			if thoughtMsgID == 0 {
+				thoughtMsgID = b.tg(text, threadID)
+			} else {
+				b.edit(thoughtMsgID, text)
+			}
+
 		case StepThought:
 			// Улучшенный формат мыслей с иконкой лампочки
 			text := "💡 _" + truncate(step.Content, 300) + "_"
