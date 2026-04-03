@@ -291,7 +291,8 @@ func (b *Bot) runCodingTask(description string, _ int) {
 	task := &Task{
 		ID: taskID, Description: description,
 		Owner: o, Repo: r,
-		Steps: make(chan Step, 100),
+		Steps:     make(chan Step, 100),
+		StartedAt: time.Now(),
 	}
 	b.tasksMu.Lock()
 	b.tasks[taskID] = task
@@ -328,6 +329,12 @@ func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 				actionText := formatToolCall(step.Content)
 				b.edit(thoughtMsgID, actionText)
 			}
+
+		case StepResult:
+			// Отправляем результат выполнения тула как новое сообщение
+			resultText := "✓ _" + truncate(step.Content, 400) + "_"
+			b.tg(resultText, threadID)
+			thoughtMsgID = 0 // сбрасываем для следующей мысли
 
 		case StepPR:
 			prNum = step.PRNumber
@@ -385,7 +392,8 @@ func (b *Bot) watchCI(task *Task, prNum int, prURL string, pt *ProgressTracker, 
 		fix := &Task{
 			ID: task.ID + "-fix", Description: "Fix CI. Log:\n" + log_,
 			Owner: task.Owner, Repo: task.Repo, Branch: task.Branch,
-			Steps: make(chan Step, 50),
+			Steps:     make(chan Step, 50),
+			StartedAt: time.Now(),
 		}
 		fixPT := NewProgressTracker(b, "Fix CI tests", task.Owner, task.Repo, threadID)
 		go NewAgent(b.cfg, task.Owner, task.Repo).WithProgress(fixPT).WithBot(b, threadID).Run(fix)
@@ -404,11 +412,14 @@ func (b *Bot) sendTaskResult(task *Task, summary string, prNum int, prURL string
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("✅ *Задача завершена* за %s\n\n", fmtDuration(duration)))
+	sb.WriteString(fmt.Sprintf("📝 *%s*\n\n", truncate(task.Description, 100)))
+
 	if prURL != "" {
 		sb.WriteString(fmt.Sprintf("🔗 [PR #%d](%s) смержен\n\n", prNum, prURL))
 	}
+
 	if summary != "" && summary != "PR смержен автоматически" {
-		sb.WriteString("_" + truncate(summary, 200) + "_\n\n")
+		sb.WriteString("💬 _" + truncate(summary, 300) + "_\n\n")
 	}
 
 	// Ссылка на добавление в Google Calendar

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +17,7 @@ type StepType string
 const (
 	StepThought StepType = "thought"
 	StepAction  StepType = "action"
+	StepResult  StepType = "result" // результат выполнения тула
 	StepPR      StepType = "pr"
 	StepError   StepType = "error"
 	StepDone    StepType = "done"
@@ -157,6 +159,12 @@ func (a *Agent) Run(task *Task) {
 			} else if a.progress != nil {
 				a.progress.DoneStep(false)
 			}
+
+			// Отправляем результат выполнения тула в Telegram
+			if !done && prNum == 0 && errMsg == "" {
+				task.Steps <- Step{Type: StepResult, Content: truncateS(result, 500)}
+			}
+
 			if prNum > 0 {
 				task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
 				if a.progress != nil {
@@ -271,7 +279,8 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 		subTask := &Task{
 			ID: task.ID + "-sub", Description: act.Args["task"],
 			Owner: a.owner, Repo: a.repo, Branch: branch,
-			Steps: make(chan Step, 50),
+			Steps:     make(chan Step, 50),
+			StartedAt: time.Now(),
 		}
 		sub := NewAgent(a.cfg, a.owner, a.repo).WithBot(a.bot, a.threadID)
 		if a.bot != nil {
@@ -308,7 +317,8 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 					ID:          fmt.Sprintf("%s-orch-%d", task.ID, idx),
 					Description: taskDesc,
 					Owner:       a.owner, Repo: a.repo, Branch: branch,
-					Steps: make(chan Step, 50),
+					Steps:     make(chan Step, 50),
+					StartedAt: time.Now(),
 				}
 				sub := NewAgent(a.cfg, a.owner, a.repo).WithBot(a.bot, a.threadID)
 				if a.bot != nil {
