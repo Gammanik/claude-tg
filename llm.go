@@ -88,11 +88,11 @@ func (c *LLMClient) selectAnthropicModel(tier ModelTier) string {
 	case TierHaiku:
 		return "claude-haiku-4-5-20251001"
 	case TierSonnet:
-		return "claude-sonnet-4-5-20250514"
+		return "claude-sonnet-4-5-20241022"
 	case TierOpus:
 		return "claude-opus-4-5-20251101"
 	default:
-		return "claude-sonnet-4-5-20250514"
+		return "claude-sonnet-4-5-20241022"
 	}
 }
 
