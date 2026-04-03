@@ -1,179 +1,101 @@
 # 🤖 claude-tg
 
-AI-powered Telegram bot for GitHub repository management. Simple, focused, efficient.
+AI-powered Telegram bot для GitHub. Чат с кодом, автономные PR, voice support.
 
-## Features
+## Возможности
 
-### 🚀 Autonomous Coding Agent
-- **Full Development Cycle**: Reads code → Makes changes → Creates PRs → Watches CI
-- **ReAct Pattern**: Thought → Action → Observation loop (max 25 iterations)
-- **Auto-approval Gates**: PR creation requires user confirmation
-
-### 🧠 Model Hierarchy
-Smart model selection for optimal cost/performance:
-- **Haiku** (fast, cheap) - Intent routing, simple classification
-- **Sonnet** (balanced) - Chat conversations, Q&A
-- **Opus** (powerful) - Coding tasks, complex analysis
-
-### 🔧 Available Tools
-
-#### File Operations
-- 📖 `read_file` - Read file contents
-- ✏️ `write_file` - Write/modify files
-- 📁 `list_files` - List directory contents
-
-#### Code Analysis
-- 🔍 `search_code` - Search code across repository
-
-#### GitHub Integration
-- 🚀 `create_pr` - Create pull requests (with approval)
-- ✅ Auto-watch CI status
-- 🔀 Inline PR merge/close buttons
-
-### 💬 Telegram Features
-- **Voice Support**: Whisper STT (Groq) + OpenAI TTS
-- **Message History**: Search past conversations
-- **Forum Topics**: Each repo gets dedicated thread
+- 🤖 **Autonomous Agent**: читает код, делает изменения, создаёт PR, смотрит CI
+- 💬 **AI Chat**: вопросы о коде, архитектуре, объяснения
+- 🎤 **Voice**: голосовые сообщения (STT/TTS)
+- 🔀 **PR Management**: список, мерж, закрытие PR
+- 🔧 **Multi-repo**: работает со всеми твоими репозиториями
+- ⚡ **Smart Routing**: Haiku для роутинга, Sonnet для чата, Opus для кодинга
 
 ## Setup
 
-1. **Clone & Install**
 ```bash
 git clone https://github.com/Gammanik/claude-tg.git
 cd claude-tg
 go build
-```
 
-2. **Configure Environment**
-```bash
+# Настрой .env
 cp .env.example .env
-# Edit .env with your tokens
-```
+# Добавь токены: TELEGRAM_BOT_TOKEN, GITHUB_TOKEN, ANTHROPIC_API_KEY
 
-Required:
-- `TELEGRAM_BOT_TOKEN` - from @BotFather
-- `TELEGRAM_CHAT_ID` - your chat ID
-- `GITHUB_TOKEN` - GitHub personal access token
-- `ANTHROPIC_API_KEY` or `DEEPSEEK_API_KEY` - LLM provider
-
-Optional:
-- `GROQ_API_KEY` - Free STT (Whisper)
-- `OPENAI_API_KEY` - TTS (voice responses)
-
-3. **Run**
-```bash
+# Запусти
 ./claude-tg
 ```
 
-## Usage
+**Обязательные переменные:**
+- `TELEGRAM_BOT_TOKEN` - от @BotFather
+- `TELEGRAM_CHAT_ID` - твой chat ID
+- `GITHUB_TOKEN` - GitHub PAT (repo scope)
+- `ANTHROPIC_API_KEY` - Claude API ключ
 
-Just chat naturally:
+**Опциональные:**
+- `DIRECT_COMMIT=true` - коммитить прямо в main (без PR)
+- `GROQ_API_KEY` - бесплатный Whisper STT
+- `OPENAI_API_KEY` - TTS для голосовых ответов
 
-```
-"покажи PR"           → Lists open pull requests
-"смержи PR #5"        → Merges PR with confirmation
-"добавь логин кнопку" → Creates feature PR
-"что делает main.go?" → Explains code
-```
+## Использование
 
-Voice messages work too! 🎤
-
-## Commands
-
-- `/repo owner/name` - Switch repository
-- `/prs` - List open PRs
-- `/status` - Show bot status
-- `/help` - Show help
-
-**💡 Auto-detection**: Just mention any repository in `owner/repo` format — the bot will automatically switch to it!
-
-## Architecture
+Просто пиши боту естественным языком:
 
 ```
-┌─────────────┐
-│   Telegram  │
-└──────┬──────┘
-       │
-┌──────▼──────┐       ┌─────────────┐
-│     Bot     │◄──────┤  LLMClient  │  Haiku/Sonnet/Opus
-└──────┬──────┘       └─────────────┘
-       │
-┌──────▼──────┐       ┌─────────────┐
-│    Agent    │◄──────┤   GitHub    │  PRs, CI/CD
-└─────────────┘       └─────────────┘
+"покажи PR"                    → список открытых PR
+"какие у меня репо"            → твои репозитории
+"добавь logout кнопку"         → агент создаст PR
+"что делает main.go?"          → объяснение кода
+"прочитай config, исправь баг" → множественные действия
 ```
 
-**Core Files:**
-- `main.go` - Entry point
-- `bot.go` - Telegram handling, routing
-- `agent.go` - ReAct loop, tool execution
-- `llm.go` - Model hierarchy, API calls
-- `github.go` - GitHub API integration
+**Команды:**
+- `/repo owner/name` - переключить репозиторий
+- `/repos [username]` - список репозиториев
+- `/prs` - показать PR
+- `/status` - статус бота
+
+**💡 Авто-переключение:** упомяни `owner/repo` в сообщении → бот автоматически переключится
+
+## Архитектура
+
+```
+Bot → Router (Haiku) → {Chat (Sonnet) | Agent (Opus) | GitHub}
+                         ↓
+                    ReAct Loop → {read_file, write_file, create_pr}
+```
+
+**Файлы:**
+- `bot.go` - Telegram + роутинг
+- `agent.go` - ReAct loop (25 итераций макс)
+- `llm.go` - Haiku/Sonnet/Opus
+- `github.go` - GitHub API
 - `voice.go` - STT/TTS
-- `history.go` - Message search
-- `topics.go` - Forum topic management
 
-## Provider Comparison
+## Примеры
 
-| Feature | Anthropic | DeepSeek |
-|---------|-----------|----------|
-| Model Hierarchy | ✅ Haiku/Sonnet/Opus | ❌ Single model |
-| Streaming | ✅ | ❌ |
-| Prompt Caching | ✅ | ❌ |
-| Cost | $$$ | $ |
-| Quality | Best | Good |
-
-**Recommendation**: Use Anthropic for production, DeepSeek for development.
-
-## Examples
-
-### Coding Task
+**Кодинг:**
 ```
-User: добавь кнопку logout в хедер
+User: добавь валидацию в форму
 
-💭 Читаю структуру репо...
-💭 Ищу Header компонент...
-⚡ read_file(src/Header.jsx)
-✓ Found Header component
-⚡ write_file(src/Header.jsx)
-✓ Added logout button
+💭 Читаю форму...
+⚡ read_file(form.tsx)
+⚡ write_file(form.tsx)
 ⚡ create_pr
-🚀 PR #42 created
-✅ Готово за 45s
+🚀 PR #42 создан
 ```
 
-### PR Management
+**Множественные действия:**
 ```
-User: покажи PR для gammanik/myapp
+User: прочитай README и обнови версию на 2.0
 
-📋 Открытые PR для gammanik/myapp:
-
-1. #42 - Add logout button
-   ✅ Merge #42  ❌ Close #42
-
-2. #41 - Fix auth bug
-   ✅ Merge #41  ❌ Close #41
-```
-
-## Development
-
-Build:
-```bash
-go build -o claude-tg
-```
-
-Run with logging:
-```bash
-./claude-tg 2>&1 | tee bot.log
+💭 Читаю README...
+⚡ read_file(README.md)
+💭 Обновляю версию...
+⚡ write_file(README.md)
+✅ Готово (версия 2.0)
 ```
 
 ## License
 
 MIT
-
-## Credits
-
-Built with:
-- [Anthropic Claude](https://anthropic.com) - AI models
-- [go-telegram-bot-api](https://github.com/go-telegram-bot-api/telegram-bot-api) - Telegram SDK
-- [Groq](https://groq.com) - Free Whisper STT

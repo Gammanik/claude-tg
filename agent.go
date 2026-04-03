@@ -346,60 +346,51 @@ func systemPrompt(owner, repo, ctx string) string {
 ## Project Context
 %s
 
-## Tools
+## Available Tools
+
+read_file(path) - read file contents
+write_file(path, content, message) - write/update file (commits directly to branch)
+list_files(path) - list directory contents
+search_code(query) - search code in repo
+create_pr(title, body) - create pull request OR finish task (if direct commit mode)
+done(summary) - complete task without PR
+
+## Tool Usage Format
 
 <action>
 tool: "read_file"
-path: "src/components/Example.jsx"
+path: "src/main.go"
 </action>
 
 <action>
 tool: "write_file"
-path: "src/components/New.jsx"
-content: "import React from 'react';\nexport default function New() { return <div/>; }"
-message: "feat: add New component"
+path: "src/config.go"
+content: "package main\n\nfunc Config() {}"
+message: "feat: add config"
 </action>
 
-<action>
-tool: "list_files"
-path: "src"
-</action>
+## Workflow Rules
 
-<action>
-tool: "search_code"
-query: "useUserData"
-</action>
+1. Always write "Thought:" before actions to explain reasoning
+2. Read files before editing to understand existing code
+3. Multiple write_file actions → multiple commits (commits happen immediately)
+4. After all changes → call create_pr to finish
+5. Keep code style consistent with existing patterns
 
-<action>
-tool: "create_pr"
-title: "feat: add tracking screen"
-body: "## Changes\n- TrackingScreen.jsx\n- useTracking.ts"
-</action>
+## Example
 
-<action>
-tool: "done"
-summary: "Analysis complete"
-</action>
+Thought: Need to read the current implementation
+<action>tool: "read_file"
+path: "main.go"</action>
 
-## Rules
-1. Read files before writing - understand existing patterns
-2. Follow existing code style
-3. After all files written → create_pr
-4. Write "Thought:" before each action to explain your reasoning
-5. Keep changes focused - don't over-engineer
-
-Example:
-Thought: I need to understand the current auth implementation
-<action>
-tool: "read_file"
-path: "src/auth/AuthService.ts"
-</action>
-
-Thought: Now I'll add the new logout feature
-<action>
-tool: "write_file"
-path: "src/auth/AuthService.ts"
+Thought: Adding new feature based on existing patterns
+<action>tool: "write_file"
+path: "main.go"
 content: "..."
-message: "feat: add logout functionality"
-</action>`, owner, repo, ctx)
+message: "feat: add feature X"</action>
+
+Thought: All changes done, finishing
+<action>tool: "create_pr"
+title: "feat: add feature X"
+body: "Added feature X to main.go"</action>`, owner, repo, ctx)
 }
