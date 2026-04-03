@@ -16,4 +16,7 @@ type Config struct {
 	// Voice
 	OpenAIKey string // Whisper STT + TTS (платный но дёшево)
 	GroqKey   string // Whisper STT (бесплатный тир — лучше для старта)
+
+	// Features
+	UsePlanner bool // использовать Extended Thinking планировщик (default: true)
 }

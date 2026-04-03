@@ -76,6 +76,15 @@ func (a *Agent) Run(task *Task) {
 	}()
 	defer close(task.Steps)
 
+	// Проверяем нужно ли использовать планировщик
+	if !a.cfg.UsePlanner {
+		// Старое поведение - простой ReAct loop
+		a.runReActLoop(task)
+		return
+	}
+
+	// НОВОЕ ПОВЕДЕНИЕ: ДВУХФАЗНАЯ АРХИТЕКТУРА С ПЛАНИРОВЩИКОМ
+
 	// ФАЗА 1: ПЛАНИРОВАНИЕ
 	a.think("Анализирую задачу и создаю план...", task)
 
@@ -93,10 +102,9 @@ func (a *Agent) Run(task *Task) {
 	})
 
 	if err != nil {
-		task.Steps <- Step{Type: StepError, Content: "Planning failed: " + err.Error()}
-		if a.progress != nil {
-			a.progress.Error("Planning failed: " + err.Error())
-		}
+		// Fallback на старое поведение при ошибке планирования
+		task.Steps <- Step{Type: StepThought, Content: "Planning failed, using standard approach: " + err.Error()}
+		a.runReActLoop(task)
 		return
 	}
 
@@ -157,6 +165,105 @@ func (a *Agent) Run(task *Task) {
 			a.progress.Error("Failed after replanning")
 		}
 	}
+}
+
+// runReActLoop - старый ReAct loop без планировщика (для совместимости)
+func (a *Agent) runReActLoop(task *Task) {
+	a.think("Читаю структуру репо...", task)
+	ctx := a.buildContext(task.Description)
+
+	// Создаём ветку
+	branch := makeBranch(task.Description, task.ID)
+	if task.Branch != "" {
+		branch = task.Branch
+	}
+
+	a.act("git checkout -b "+branch, task)
+	if task.Branch == "" {
+		if err := a.gh.CreateBranch(branch); err != nil {
+			task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
+			return
+		}
+	}
+	task.Branch = branch
+	if a.progress != nil {
+		a.progress.SetBranch(branch)
+	}
+
+	// ReAct loop
+	messages := []msg{
+		{Role: "system", Content: systemPrompt(a.owner, a.repo, ctx)},
+		{Role: "user", Content: task.Description},
+	}
+
+	for i := 0; i < 25; i++ {
+		// Проверяем лимиты перед вызовом
+		if a.bot != nil && a.bot.limits != nil {
+			estimatedTokens := 1000
+			ok, warning := a.bot.limits.CheckLimit(estimatedTokens)
+			if !ok {
+				task.Steps <- Step{Type: StepError, Content: warning}
+				if a.progress != nil {
+					a.progress.Error(warning)
+				}
+				return
+			}
+			if warning != "" {
+				task.Steps <- Step{Type: StepThought, Content: warning}
+			}
+		}
+
+		resp, err := a.llm(messages)
+		if err != nil {
+			task.Steps <- Step{Type: StepError, Content: "LLM: " + err.Error()}
+			return
+		}
+		messages = append(messages, msg{Role: "assistant", Content: resp})
+
+		// Передаем usage в progress tracker и обновляем лимиты
+		if a.progress != nil {
+			a.progress.AddTokenUsage(lastUsage.Input, lastUsage.Output, lastUsage.CacheRead, lastUsage.CacheWrite)
+		}
+		if a.bot != nil && a.bot.limits != nil {
+			totalTokens := lastUsage.Input + lastUsage.Output
+			a.bot.limits.CheckLimit(totalTokens)
+		}
+
+		if t := extractThought(resp); t != "" {
+			a.think(t, task)
+		}
+
+		actions := parseActions(resp)
+		if len(actions) == 0 {
+			task.Steps <- Step{Type: StepDone, Content: resp}
+			if a.progress != nil {
+				a.progress.Finish()
+			}
+			return
+		}
+
+		// Выполняем actions параллельно с учетом зависимостей
+		results, prNum, prURL, done := a.executeActionsParallel(actions, branch, task)
+
+		if prNum > 0 {
+			task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
+			if a.progress != nil {
+				a.progress.SetPR(prNum, prURL)
+			}
+			return
+		}
+		if done {
+			task.Steps <- Step{Type: StepDone, Content: results}
+			if a.progress != nil {
+				a.progress.Finish()
+			}
+			return
+		}
+
+		// Собираем результаты для передачи в LLM
+		messages = append(messages, msg{Role: "user", Content: "Tool results:\n" + results})
+	}
+	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов"}
 }
 
 // ExecuteWithPlan выполняет план используя ReAct loop с guidance от плана

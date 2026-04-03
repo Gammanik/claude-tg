@@ -32,6 +32,7 @@ func main() {
 		AnthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		OpenAIKey:     os.Getenv("OPENAI_API_KEY"), // для Whisper STT + TTS
 		GroqKey:       os.Getenv("GROQ_API_KEY"),   // бесплатный Whisper
+		UsePlanner:    getEnv("USE_PLANNER", "false") == "true",
 	}
 
 	bot := NewBot(cfg)
