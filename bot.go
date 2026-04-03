@@ -163,6 +163,9 @@ func (b *Bot) route(text string, threadID int) {
 	case text == "/start" || text == "/help":
 		b.tg(b.helpText(), threadID)
 		return
+	case text == "/version":
+		b.sendVersion(threadID)
+		return
 	case text == "/status":
 		b.sendStatus(threadID)
 		return
@@ -644,6 +647,11 @@ func (b *Bot) sendStatus(threadID int) {
 	b.tg(fmt.Sprintf("📊 Репо: `%s/%s` | Задач: %d | Напоминалок: %d", o, r, n, nr), threadID)
 }
 
+func (b *Bot) sendVersion(threadID int) {
+	version := getVersion()
+	b.tg(version, threadID)
+}
+
 func (b *Bot) sendPRs(threadID int) {
 	o, r := b.currentRepo()
 	prs, err := NewGitHubClient(b.cfg.GitHubToken, o, r).ListPRs()
@@ -777,7 +785,7 @@ func (b *Bot) helpText() string {
 		"Каждый репо получает свой тред в группе автоматически.\n\n"+
 		"*Команды:*\n"+
 		"`/repo owner/name` | `/prs` | `/tasks`\n"+
-		"`/reminders` | `/status`", o, r)
+		"`/reminders` | `/status` | `/version`", o, r)
 }
 
 type Button struct{ Label, Data string }
