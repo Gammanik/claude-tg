@@ -154,6 +154,96 @@ remind me tomorrow at 9am about meeting
 создай топики для активных репо
 ```
 
+### CLI Mode
+
+The bot can also be used from the terminal with full progress tracking and statistics.
+
+#### Quick Commands
+
+```bash
+# Show status
+./claude-tg -status
+
+# Ask a question (streaming response)
+./claude-tg -ask "how does authentication work?"
+
+# Execute a task with live progress
+./claude-tg -task "add logout button to navbar"
+
+# Self-modification (work on bot's own code)
+./claude-tg -self "improve error handling in agent.go"
+
+# Show conversation history
+./claude-tg -history
+
+# Interactive REPL mode
+./claude-tg -cli
+```
+
+#### Interactive Mode
+
+```bash
+./claude-tg -cli
+
+🤖 claude-tg CLI
+Команды:
+  task <описание>  - выполнить задачу с прогрессом
+  self <описание>  - модифицировать бота (PR в claude-tg)
+  ask <вопрос>     - задать вопрос боту
+  history [query]  - показать историю сообщений
+  status           - статус бота
+  repo <owner/name> - переключить репозиторий
+  exit             - выход
+
+> task add dark mode toggle
+💭 Analyzing repository structure...
+⚡ read_file(src/App.tsx)
+✓ Found theme configuration
+⚡ write_file(src/components/ThemeToggle.tsx)
+✓ Created ThemeToggle component
+
+🚀 PR #15 создан: https://github.com/...
+
+✅ Задача завершена: Added dark mode toggle component
+
+🔢 Токены: 8.2K in / 1.4K out
+💾 Кэш: 6.1K read / 982 write
+💰 ~$0.0421 (6s)
+📊 9.6K токенов / 2 вызовов
+
+⏱ Время выполнения: 6s
+```
+
+#### Self-Modification Example
+
+The bot can modify its own code and create PRs:
+
+```bash
+./claude-tg -self "add retry logic for failed API calls"
+
+🔧 Самомодификация: Gammanik/claude-tg
+💭 Reading agent.go...
+⚡ read_file(agent.go)
+✓ Found API call locations
+💭 Adding exponential backoff...
+⚡ write_file(agent.go)
+✓ Updated with retry logic
+⚡ create_pr
+✓ Created PR with changes
+
+🚀 PR #42: Add retry logic for API calls
+https://github.com/Gammanik/claude-tg/pull/42
+
+✅ Задача завершена за 8s
+```
+
+Benefits of CLI mode:
+- Access conversation history from Telegram
+- Execute tasks with same progress tracking as Telegram
+- Self-modification with automatic PR creation
+- Terminal-friendly streaming output
+- Perfect for automation and scripting
+
 ## Example Workflow
 
 ### Coding Task with Parallel Execution
@@ -290,10 +380,12 @@ read_file(A) → write_file(B, content_from_A)
 
 ```
 peerpack-bot/
-├── main.go         # Entry point
+├── main.go         # Entry point & CLI flags
 ├── config.go       # Configuration
 ├── bot.go          # Telegram bot & message routing
+├── cli.go          # CLI interface (terminal mode)
 ├── agent.go        # AI agent & ReAct loop
+├── dag.go          # Dependency graph for parallel execution
 ├── stream.go       # LLM streaming
 ├── progress.go     # Live progress tracking
 ├── tokens.go       # Token statistics & limits

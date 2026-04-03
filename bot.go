@@ -60,8 +60,12 @@ type extUpdate struct {
 	CallbackQuery *tgbotapi.CallbackQuery `json:"callback_query,omitempty"`
 }
 
+func (b *Bot) initAPI() (*tgbotapi.BotAPI, error) {
+	return tgbotapi.NewBotAPI(b.cfg.TelegramToken)
+}
+
 func (b *Bot) Start() error {
-	api, err := tgbotapi.NewBotAPI(b.cfg.TelegramToken)
+	api, err := b.initAPI()
 	if err != nil {
 		return err
 	}
@@ -260,6 +264,38 @@ func (b *Bot) chat(text string, threadID int) {
 	}
 	log.Printf("chat: done, full length=%d", len(full))
 	b.edit(phID, full)
+
+	// Голосовое сообщение для длинных ответов (> 300 символов)
+	if b.cfg.OpenAIKey != "" && len(full) > 300 {
+		go b.sendVoice(removeMarkdown(truncate(full, 500)), threadID)
+	}
+}
+
+// sendVoice отправляет голосовое сообщение в тред (если указан)
+func (b *Bot) sendVoice(text string, threadID int) {
+	if ogg, err := NewVoice(b.cfg).Synthesize(text); err == nil {
+		msg := tgbotapi.NewVoice(b.chatID, tgbotapi.FileBytes{Name: "voice.ogg", Bytes: ogg})
+		// tgbotapi v5.5.1 не поддерживает MessageThreadID для голосовых, используем send без тредов
+		// TODO: использовать raw API для отправки в треды
+		b.api.Send(msg)
+	}
+}
+
+// removeMarkdown убирает основные markdown символы для голосового озвучивания
+func removeMarkdown(text string) string {
+	// Убираем ``` блоки кода
+	text = strings.ReplaceAll(text, "```", "")
+	// Убираем ** жирный
+	text = strings.ReplaceAll(text, "**", "")
+	// Убираем __ курсив
+	text = strings.ReplaceAll(text, "__", "")
+	// Убираем _ курсив
+	text = strings.ReplaceAll(text, "_", "")
+	// Убираем ` inline code
+	text = strings.ReplaceAll(text, "`", "")
+	// Убираем > цитаты
+	text = strings.ReplaceAll(text, "> ", "")
+	return text
 }
 
 // ── Voice ─────────────────────────────────────────────────────
@@ -456,13 +492,8 @@ func (b *Bot) sendTaskResult(task *Task, summary string, prNum int, prURL string
 
 	// Голосовое резюме
 	if b.cfg.OpenAIKey != "" {
-		go func() {
-			text := fmt.Sprintf("Задача выполнена за %s. %s", fmtDuration(duration), truncate(summary, 200))
-			if ogg, err := NewVoice(b.cfg).Synthesize(text); err == nil {
-				b.api.Send(tgbotapi.NewVoice(b.chatID,
-					tgbotapi.FileBytes{Name: "done.ogg", Bytes: ogg}))
-			}
-		}()
+		text := fmt.Sprintf("Задача выполнена за %s. %s", fmtDuration(duration), truncate(summary, 200))
+		go b.sendVoice(text, threadID)
 	}
 }
 

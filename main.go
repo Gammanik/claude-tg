@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 
@@ -10,6 +11,15 @@ import (
 func main() {
 	// Загружаем .env файл (игнорируем ошибки - переменные могут быть в окружении)
 	godotenv.Load()
+
+	// CLI флаги
+	cliMode := flag.Bool("cli", false, "Интерактивный CLI режим")
+	taskCmd := flag.String("task", "", "Выполнить задачу и выйти")
+	selfCmd := flag.String("self", "", "Самомодификация (выполнить задачу на claude-tg)")
+	askCmd := flag.String("ask", "", "Задать вопрос боту")
+	historyCmd := flag.Bool("history", false, "Показать историю сообщений")
+	statusCmd := flag.Bool("status", false, "Показать статус бота")
+	flag.Parse()
 
 	cfg := Config{
 		TelegramToken: mustEnv("TELEGRAM_BOT_TOKEN"),
@@ -24,11 +34,48 @@ func main() {
 		GroqKey:       os.Getenv("GROQ_API_KEY"),   // бесплатный Whisper
 	}
 
-	log.Printf("🤖 claude-tg starting (provider=%s)", cfg.LLMProvider)
-
 	bot := NewBot(cfg)
-	if err := bot.Start(); err != nil {
-		log.Fatal(err)
+
+	// CLI режимы
+	cli := NewCLI(bot)
+
+	// Инициализируем историю для CLI режима
+	if *cliMode || *taskCmd != "" || *selfCmd != "" || *askCmd != "" || *historyCmd || *statusCmd {
+		api, err := bot.initAPI()
+		if err != nil {
+			log.Fatal(err)
+		}
+		bot.api = api
+		bot.history = NewMessageHistory(api, bot.chatID)
+		bot.limits = NewUsageLimits()
+	}
+
+	switch {
+	case *cliMode:
+		log.Printf("🤖 claude-tg CLI mode (provider=%s)", cfg.LLMProvider)
+		cli.RunInteractive()
+
+	case *taskCmd != "":
+		cli.runTask(*taskCmd, false)
+
+	case *selfCmd != "":
+		cli.runTask(*selfCmd, true)
+
+	case *askCmd != "":
+		cli.ask(*askCmd)
+
+	case *historyCmd:
+		cli.showHistory("")
+
+	case *statusCmd:
+		cli.showStatus()
+
+	default:
+		// Обычный режим бота
+		log.Printf("🤖 claude-tg starting (provider=%s)", cfg.LLMProvider)
+		if err := bot.Start(); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 
