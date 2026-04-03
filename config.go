@@ -2,21 +2,21 @@ package main
 
 // Config holds all runtime configuration
 type Config struct {
+	// Telegram
 	TelegramToken string
 	AllowedChatID string
 
+	// GitHub
 	GitHubToken  string
 	DefaultOwner string
 	DefaultRepo  string
 
-	LLMProvider  string // "deepseek" | "claude"
-	DeepSeekKey  string
+	// LLM Provider (anthropic | deepseek)
+	LLMProvider  string
 	AnthropicKey string
+	DeepSeekKey  string
 
-	// Voice
-	OpenAIKey string // Whisper STT + TTS (платный но дёшево)
-	GroqKey   string // Whisper STT (бесплатный тир — лучше для старта)
-
-	// Features
-	UsePlanner bool // использовать Extended Thinking планировщик (default: true)
+	// Voice (optional)
+	OpenAIKey string // TTS (платный)
+	GroqKey   string // STT бесплатный
 }

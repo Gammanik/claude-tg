@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"log"
 	"os"
 
@@ -9,17 +8,8 @@ import (
 )
 
 func main() {
-	// Загружаем .env файл (игнорируем ошибки - переменные могут быть в окружении)
+	// Загружаем .env файл
 	godotenv.Load()
-
-	// CLI флаги
-	cliMode := flag.Bool("cli", false, "Интерактивный CLI режим")
-	taskCmd := flag.String("task", "", "Выполнить задачу и выйти")
-	selfCmd := flag.String("self", "", "Самомодификация (выполнить задачу на claude-tg)")
-	askCmd := flag.String("ask", "", "Задать вопрос боту")
-	historyCmd := flag.Bool("history", false, "Показать историю сообщений")
-	statusCmd := flag.Bool("status", false, "Показать статус бота")
-	flag.Parse()
 
 	cfg := Config{
 		TelegramToken: mustEnv("TELEGRAM_BOT_TOKEN"),
@@ -27,56 +17,18 @@ func main() {
 		GitHubToken:   mustEnv("GITHUB_TOKEN"),
 		DefaultOwner:  getEnv("GITHUB_DEFAULT_OWNER", "Gammanik"),
 		DefaultRepo:   getEnv("GITHUB_DEFAULT_REPO", "PeerPack"),
-		LLMProvider:   getEnv("LLM_PROVIDER", "deepseek"),
-		DeepSeekKey:   os.Getenv("DEEPSEEK_API_KEY"),
+		LLMProvider:   getEnv("LLM_PROVIDER", "anthropic"),
 		AnthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
-		OpenAIKey:     os.Getenv("OPENAI_API_KEY"), // для Whisper STT + TTS
-		GroqKey:       os.Getenv("GROQ_API_KEY"),   // бесплатный Whisper
-		UsePlanner:    getEnv("USE_PLANNER", "false") == "true",
+		DeepSeekKey:   os.Getenv("DEEPSEEK_API_KEY"),
+		OpenAIKey:     os.Getenv("OPENAI_API_KEY"),
+		GroqKey:       os.Getenv("GROQ_API_KEY"),
 	}
+
+	log.Printf("🤖 claude-tg starting (provider=%s)", cfg.LLMProvider)
 
 	bot := NewBot(cfg)
-
-	// CLI режимы
-	cli := NewCLI(bot)
-
-	// Инициализируем историю для CLI режима
-	if *cliMode || *taskCmd != "" || *selfCmd != "" || *askCmd != "" || *historyCmd || *statusCmd {
-		api, err := bot.initAPI()
-		if err != nil {
-			log.Fatal(err)
-		}
-		bot.api = api
-		bot.history = NewMessageHistory(api, bot.chatID)
-		bot.limits = NewUsageLimits()
-	}
-
-	switch {
-	case *cliMode:
-		log.Printf("🤖 claude-tg CLI mode (provider=%s)", cfg.LLMProvider)
-		cli.RunInteractive()
-
-	case *taskCmd != "":
-		cli.runTask(*taskCmd, false)
-
-	case *selfCmd != "":
-		cli.runTask(*selfCmd, true)
-
-	case *askCmd != "":
-		cli.ask(*askCmd)
-
-	case *historyCmd:
-		cli.showHistory("")
-
-	case *statusCmd:
-		cli.showStatus()
-
-	default:
-		// Обычный режим бота
-		log.Printf("🤖 claude-tg starting (provider=%s)", cfg.LLMProvider)
-		if err := bot.Start(); err != nil {
-			log.Fatal(err)
-		}
+	if err := bot.Start(); err != nil {
+		log.Fatal(err)
 	}
 }
 

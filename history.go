@@ -109,7 +109,7 @@ func FormatSearchResults(results []HistoryMessage) string {
 
 	for i, msg := range results {
 		timeAgo := time.Since(msg.Timestamp).Round(time.Minute)
-		text := truncateS(msg.Text, 150)
+		text := truncate(msg.Text, 150)
 		sb.WriteString(fmt.Sprintf("%d. [%s назад] %s: %s\n",
 			i+1, fmtDuration(timeAgo), msg.From, text))
 	}
@@ -140,7 +140,7 @@ func (h *MessageHistory) GetThreadSummary(threadID int, count int) string {
 
 	for _, msg := range threadMessages {
 		timeStr := msg.Timestamp.Format("15:04")
-		text := truncateS(msg.Text, 100)
+		text := truncate(msg.Text, 100)
 		sb.WriteString(fmt.Sprintf("[%s] %s: %s\n", timeStr, msg.From, text))
 	}
 

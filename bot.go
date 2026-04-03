@@ -13,44 +13,37 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-type Reminder struct {
-	ID, Text string
-	At       time.Time
-	ThreadID int
-}
-
 type Bot struct {
-	api         *tgbotapi.BotAPI
-	cfg         Config
-	chatID      int64
-	topics      *TopicManager
-	apiKeys     *APIKeyManager // управление API ключами
+	api     *tgbotapi.BotAPI
+	cfg     Config
+	chatID  int64
+	llm     *LLMClient
+	topics  *TopicManager
+	history *MessageHistory
+
 	repoMu      sync.RWMutex
 	owner, repo string
-	tasksMu     sync.Mutex
-	tasks       map[string]*Task
-	remindersMu sync.Mutex
-	reminders   []Reminder
-	approvalsMu sync.Mutex
-	approvals   map[string]chan bool // taskID → ответ пользователя
-	history     *MessageHistory      // история сообщений для поиска
-	limits      *UsageLimits         // лимиты использования API
+
+	tasksMu   sync.Mutex
+	tasks     map[string]*Task
+	approvals map[string]chan bool
 }
 
 func NewBot(cfg Config) *Bot {
 	id, _ := strconv.ParseInt(cfg.AllowedChatID, 10, 64)
-	b := &Bot{cfg: cfg, chatID: id,
-		owner: cfg.DefaultOwner, repo: cfg.DefaultRepo,
+	b := &Bot{
+		cfg:       cfg,
+		chatID:    id,
+		llm:       NewLLMClient(cfg.AnthropicKey, cfg.DeepSeekKey, cfg.LLMProvider),
+		owner:     cfg.DefaultOwner,
+		repo:      cfg.DefaultRepo,
 		tasks:     make(map[string]*Task),
 		approvals: make(map[string]chan bool),
 	}
 	b.topics = NewTopicManager(cfg.TelegramToken, id)
-	b.apiKeys = NewAPIKeyManager(b)
 	return b
 }
 
-// extMessage — расширяет tgbotapi.Message полем message_thread_id,
-// которое отсутствует в go-telegram-bot-api v5.5.1
 type extMessage struct {
 	tgbotapi.Message
 	MessageThreadID int `json:"message_thread_id,omitempty"`
@@ -62,24 +55,25 @@ type extUpdate struct {
 	CallbackQuery *tgbotapi.CallbackQuery `json:"callback_query,omitempty"`
 }
 
-func (b *Bot) initAPI() (*tgbotapi.BotAPI, error) {
-	return tgbotapi.NewBotAPI(b.cfg.TelegramToken)
-}
-
 func (b *Bot) Start() error {
-	api, err := b.initAPI()
+	api, err := tgbotapi.NewBotAPI(b.cfg.TelegramToken)
 	if err != nil {
 		return err
 	}
 	b.api = api
 	b.history = NewMessageHistory(api, b.chatID)
-	b.limits = NewUsageLimits()
 
-	// Проверка API ключей
-	b.checkAPIKeys()
+	// Валидация GitHub токена
+	if b.cfg.GitHubToken != "" {
+		gh := NewGitHubClient(b.cfg.GitHubToken, "test", "test")
+		if login, err := gh.ValidateToken(); err != nil {
+			log.Printf("⚠️  GitHub token invalid: %v", err)
+		} else {
+			log.Printf("✅ GitHub: @%s", login)
+		}
+	}
 
-	log.Printf("✅ @%s online", api.Self.UserName)
-	go b.reminderLoop()
+	log.Printf("✅ Bot @%s online (provider=%s)", api.Self.UserName, b.cfg.LLMProvider)
 
 	client := &http.Client{Timeout: 65 * time.Second}
 	offset := 0
@@ -116,7 +110,7 @@ func (b *Bot) fetchUpdates(offset int, client *http.Client) ([]extUpdate, int) {
 		Result []extUpdate `json:"result"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("getUpdates decode: %v", err)
+		log.Printf("decode: %v", err)
 		return nil, offset
 	}
 
@@ -129,19 +123,21 @@ func (b *Bot) fetchUpdates(offset int, client *http.Client) ([]extUpdate, int) {
 	return result.Result, newOffset
 }
 
-// ── Routing ───────────────────────────────────────────────────
+// ── Message routing ───────────────────────────────────────────
 
 func (b *Bot) handleMessage(msg *tgbotapi.Message, threadID int) {
+	// Голосовые сообщения
 	if msg.Voice != nil {
 		b.handleVoice(msg, threadID)
 		return
 	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		return
 	}
 
-	// Сохраняем в историю для поиска
+	// Сохраняем в историю
 	from := "user"
 	if msg.From != nil && msg.From.UserName != "" {
 		from = msg.From.UserName
@@ -152,291 +148,62 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message, threadID int) {
 		b.history.AddMessage(msg.MessageID, threadID, from, text)
 	}
 
+	// Команды
+	switch {
+	case text == "/start" || text == "/help":
+		b.tg(b.helpText(), threadID)
+		return
+	case text == "/status":
+		b.sendStatus(threadID)
+		return
+	case text == "/prs":
+		b.listPRs(threadID)
+		return
+	case strings.HasPrefix(text, "/repo "):
+		b.setRepo(strings.TrimPrefix(text, "/repo "), threadID)
+		return
+	}
+
+	// Автоопределение намерения
 	b.route(text, threadID)
 }
 
 func (b *Bot) route(text string, threadID int) {
-	lower := strings.ToLower(text)
+	o, r := b.currentRepo()
 
-	if containsAny(lower, "себя", "себе", "yourself", "claude-tg") {
-		b.repoMu.Lock()
-		b.owner, b.repo = "Gammanik", "claude-tg"
-		b.repoMu.Unlock()
+	// Используем Haiku для быстрой классификации
+	intent, err := b.llm.RouteIntent(text, o, r)
+	if err != nil {
+		log.Printf("route error: %v, fallback to chat", err)
+		b.chat(text, threadID)
+		return
 	}
+
+	intent = strings.TrimSpace(strings.ToLower(intent))
+	log.Printf("intent: %s", intent)
 
 	switch {
-	case text == "/start" || text == "/help":
-		b.tg(b.helpText(), 0)
-		return
-	case text == "/version":
-		b.sendVersion(0)
-		return
-	case text == "/status":
-		b.sendStatus(0)
-		return
-	case text == "/prs":
-		b.sendPRs(0)
-		return
-	case text == "/tasks":
-		b.sendTasks(0)
-		return
-	case text == "/reminders":
-		b.sendReminders(0)
-		return
-	case strings.HasPrefix(text, "/repo "):
-		b.setRepo(strings.TrimPrefix(text, "/repo "), 0)
-		return
-	case strings.HasPrefix(text, "/remind "):
-		b.addReminder(strings.TrimPrefix(text, "/remind "), 0)
-		return
-	case strings.HasPrefix(text, "/cancel "):
-		b.cancelTask(strings.TrimPrefix(text, "/cancel "), 0)
-		return
-	}
-
-	// Напоминания (быстрая проверка)
-	if looksLikeReminder(lower) {
-		b.handleReminderNLP(text, 0)
-		return
-	}
-
-	// Все остальное - пусть LLM решает что делать
-	b.handleUserMessage(text)
-}
-
-// looksLikeTask - простая эвристика для CLI режима (в боте LLM сам решает)
-func looksLikeTask(lower string) bool {
-	taskKeywords := []string{
-		"добавь", "сделай", "создай", "напиши", "исправь", "fix", "add", "create",
-		"рефактори", "refactor", "удали", "реализуй", "implement", "перепиши",
-		"rewrite", "обнови", "update", "измени", "поменяй", "смени", "deploy",
-		"покрой тестами",
-	}
-
-	for _, kw := range taskKeywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-func looksLikeReminder(lower string) bool {
-	for _, kw := range []string{"напомни", "remind me", "напоминалк", "поставь таймер"} {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// ── Chat ──────────────────────────────────────────────────────
-
-// handleUserMessage - главный обработчик сообщений
-func (b *Bot) handleUserMessage(text string) {
-	// Используем LLM роутер для определения намерения
-	log.Printf("handleUserMessage: routing text=%q", truncate(text, 100))
-
-	intent, err := b.RouteRequest(text)
-	if err != nil {
-		log.Printf("handleUserMessage: router error - %v, fallback to chat", err)
-		// Fallback на обычный чат при ошибке роутера
-		b.handleChat(text)
-		return
-	}
-
-	log.Printf("handleUserMessage: intent=%s, params=%v", intent.Type, intent.Params)
-
-	switch intent.Type {
-	case "list_prs":
-		b.handleListPRs(0)
-	case "merge_pr":
+	case strings.Contains(intent, "list_prs"):
+		b.listPRs(threadID)
+	case strings.Contains(intent, "merge_pr"):
 		prNum := extractPRNumber(text)
-		if num, ok := intent.Params["pr_number"]; ok && prNum == 0 {
-			fmt.Sscanf(num, "%d", &prNum)
-		}
 		if prNum == 0 {
-			b.tg("❌ Не могу определить номер PR. Попробуй: 'смержи PR #5' или 'смержи пятый PR'", 0)
+			b.tg("❌ Укажи номер PR (например: 'смержи #5')", threadID)
 			return
 		}
-		b.handleMergePR(prNum, 0)
-	case "close_pr":
+		b.mergePR(prNum, threadID)
+	case strings.Contains(intent, "close_pr"):
 		prNum := extractPRNumber(text)
-		if num, ok := intent.Params["pr_number"]; ok && prNum == 0 {
-			fmt.Sscanf(num, "%d", &prNum)
-		}
 		if prNum == 0 {
-			b.tg("❌ Не могу определить номер PR. Попробуй: 'закрой PR #5' или 'закрой пятый PR'", 0)
+			b.tg("❌ Укажи номер PR (например: 'закрой #5')", threadID)
 			return
 		}
-		b.handleClosePR(prNum, 0)
-	case "coding_task":
-		log.Printf("handleUserMessage: coding task detected")
-		b.runCodingTask(text, 0)
-	case "chat":
-		b.handleChat(text)
+		b.closePR(prNum, threadID)
+	case strings.Contains(intent, "code"):
+		b.runTask(text, threadID)
 	default:
-		log.Printf("handleUserMessage: unknown intent type=%s, fallback to chat", intent.Type)
-		b.handleChat(text)
+		b.chat(text, threadID)
 	}
-}
-
-// handleChat - обычный чат с ассистентом
-func (b *Bot) handleChat(text string) {
-	phID := b.tg("💭", 0)
-	log.Printf("handleChat: text=%q", truncate(text, 100))
-
-	o, r := b.currentRepo()
-	system := fmt.Sprintf(`Ты AI-ассистент разработчика Никиты. Репо: %s/%s. Отвечай кратко и по-дружески на русском.`, o, r)
-
-	// Используем провайдер из конфига
-	messages := []msg{
-		{Role: "system", Content: system},
-		{Role: "user", Content: text},
-	}
-
-	// Пробуем со streaming если Anthropic
-	if b.cfg.LLMProvider == "claude" && b.cfg.AnthropicKey != "" {
-		full, err := b.streamClaude(system, text, func(partial string) {
-			b.edit(phID, partial+" ▌")
-		})
-		if err != nil {
-			log.Printf("handleChat: stream error - %v", err)
-			// Показываем красивую ошибку
-			errMsg := b.formatLLMError(err)
-			b.edit(phID, errMsg)
-			return
-		}
-		log.Printf("handleChat: stream success, length=%d", len(full))
-		b.edit(phID, full)
-
-		// Голосовое сообщение для длинных ответов
-		if b.cfg.OpenAIKey != "" && len(full) > 300 {
-			go b.sendVoice(removeMarkdown(truncate(full, 500)), 0)
-		}
-		return
-	}
-
-	// Для других провайдеров - обычный вызов
-	b.handleUserMessageFallback(text, phID, messages)
-}
-
-// handleUserMessageFallback - обычный вызов LLM без streaming
-func (b *Bot) handleUserMessageFallback(text string, phID int, messages []msg) {
-	o, r := b.currentRepo()
-	agent := NewAgent(b.cfg, o, r)
-
-	resp, err := agent.llm(messages)
-	if err != nil {
-		log.Printf("handleUserMessage: llm error - %v", err)
-
-		// Красивое сообщение об ошибке
-		errMsg := b.formatLLMError(err)
-		b.edit(phID, errMsg)
-		return
-	}
-
-	log.Printf("handleUserMessage: response length=%d", len(resp))
-	b.edit(phID, resp)
-
-	// Голосовое сообщение для длинных ответов
-	if b.cfg.OpenAIKey != "" && len(resp) > 300 {
-		go b.sendVoice(removeMarkdown(truncate(resp, 500)), 0)
-	}
-}
-
-// formatLLMError форматирует ошибку LLM в понятное сообщение
-func (b *Bot) formatLLMError(err error) string {
-	errStr := err.Error()
-
-	// Уже отформатированные ошибки (из callClaude/callDeepSeek)
-	if strings.Contains(errStr, "👉") {
-		return errStr
-	}
-
-	// API ключ проблемы
-	if strings.Contains(errStr, "invalid x-api-key") || strings.Contains(errStr, "invalid_api_key") {
-		if b.cfg.LLMProvider == "claude" {
-			return `❌ *Неправильный Anthropic API ключ*
-
-Проверь переменную окружения:
-` + "`ANTHROPIC_API_KEY=sk-ant-...`" + `
-
-📝 Получить ключ: https://console.anthropic.com/settings/keys
-🔧 Или переключись на DeepSeek: ` + "`LLM_PROVIDER=deepseek`"
-		}
-		return `❌ *Неправильный API ключ*
-
-Проверь переменную: ` + "`" + strings.ToUpper(b.cfg.LLMProvider) + "_API_KEY`"
-	}
-
-	// Rate limit
-	if strings.Contains(errStr, "rate_limit") || strings.Contains(errStr, "429") {
-		return "⏰ *Rate limit превышен*\n\nПопробуй через минуту или смени провайдера в .env"
-	}
-
-	// Общая ошибка
-	return fmt.Sprintf("❌ *Ошибка LLM*\n\n`%s`\n\n💡 Проверь API ключи в .env", truncate(errStr, 200))
-}
-
-func (b *Bot) chat(text string, threadID int) {
-	phID := b.tg("🤔 _анализирую вопрос..._", threadID)
-	b.chatWithStreaming(text, phID)
-}
-
-func (b *Bot) chatWithStreaming(text string, phID int) {
-	log.Printf("chat: msgID=%d text=%q", phID, truncate(text, 100))
-
-	o, r := b.currentRepo()
-	system := fmt.Sprintf(
-		`Ты AI-ассистент разработчика Никиты. Репо: %s/%s. Отвечай кратко на русском.`, o, r)
-
-	full, err := b.streamClaude(system, text, func(partial string) {
-		b.edit(phID, partial+" ▌")
-	})
-	if err != nil {
-		errMsg := "❌ " + err.Error()
-		log.Printf("chat: error streaming - %v", err)
-		b.edit(phID, errMsg)
-		return
-	}
-	if full == "" {
-		full = "_(нет ответа)_"
-	}
-	log.Printf("chat: done, full length=%d", len(full))
-	b.edit(phID, full)
-
-	// Голосовое сообщение для длинных ответов (> 300 символов)
-	if b.cfg.OpenAIKey != "" && len(full) > 300 {
-		go b.sendVoice(removeMarkdown(truncate(full, 500)), 0)
-	}
-}
-
-// sendVoice отправляет голосовое сообщение в тред (если указан)
-func (b *Bot) sendVoice(text string, threadID int) {
-	if ogg, err := NewVoice(b.cfg).Synthesize(text); err == nil {
-		msg := tgbotapi.NewVoice(b.chatID, tgbotapi.FileBytes{Name: "voice.ogg", Bytes: ogg})
-		// tgbotapi v5.5.1 не поддерживает MessageThreadID для голосовых, используем send без тредов
-		// TODO: использовать raw API для отправки в треды
-		b.api.Send(msg)
-	}
-}
-
-// removeMarkdown убирает основные markdown символы для голосового озвучивания
-func removeMarkdown(text string) string {
-	// Убираем ``` блоки кода
-	text = strings.ReplaceAll(text, "```", "")
-	// Убираем ** жирный
-	text = strings.ReplaceAll(text, "**", "")
-	// Убираем __ курсив
-	text = strings.ReplaceAll(text, "__", "")
-	// Убираем _ курсив
-	text = strings.ReplaceAll(text, "_", "")
-	// Убираем ` inline code
-	text = strings.ReplaceAll(text, "`", "")
-	// Убираем > цитаты
-	text = strings.ReplaceAll(text, "> ", "")
-	return text
 }
 
 // ── Voice ─────────────────────────────────────────────────────
@@ -448,348 +215,174 @@ func (b *Bot) handleVoice(msg *tgbotapi.Message, threadID int) {
 		b.edit(phID, "❌ "+err.Error())
 		return
 	}
-	text, err := NewVoice(b.cfg).Transcribe(fileURL)
+
+	voice := NewVoice(b.cfg)
+	text, err := voice.Transcribe(fileURL)
 	if err != nil {
-		b.edit(phID, "❌ STT: "+err.Error()+
-			"\n\n👉 Добавь `GROQ_API_KEY` в Railway Variables (бесплатно: console.groq.com)")
+		b.edit(phID, "❌ STT: "+err.Error())
 		return
 	}
+
 	b.edit(phID, "🎤 _"+text+"_")
 	time.Sleep(200 * time.Millisecond)
 	b.route(text, threadID)
 }
 
-// ── Direct actions ────────────────────────────────────────────
-
-func (b *Bot) handleDirectAction(act *directAction, threadID int) {
-	switch act.kind {
-	case "set_avatar":
-		phID := b.tg("🎨 _Генерирую аватарку..._", threadID)
-		if err := b.setBotAvatar(); err != nil {
-			b.edit(phID, fmt.Sprintf("❌ %v\n\nДобавь `OPENAI_API_KEY` для DALL-E генерации", err))
-		} else {
-			b.edit(phID, "✅ Аватарка обновлена!")
-		}
-	case "set_name":
-		b.tg("⚠️ Имя меняется через @BotFather → /setname", threadID)
+func (b *Bot) sendVoice(text string, threadID int) {
+	if b.cfg.OpenAIKey == "" {
+		return
+	}
+	voice := NewVoice(b.cfg)
+	ogg, err := voice.Synthesize(text)
+	if err == nil {
+		msg := tgbotapi.NewVoice(b.chatID, tgbotapi.FileBytes{Name: "voice.ogg", Bytes: ogg})
+		// TODO: add threadID support via raw API
+		b.api.Send(msg)
 	}
 }
 
-// ── Coding agent с живым прогрессом ──────────────────────────
+// ── Chat ──────────────────────────────────────────────────────
 
-func (b *Bot) runCodingTask(description string, _ int) {
+func (b *Bot) chat(text string, threadID int) {
 	o, r := b.currentRepo()
+	system := fmt.Sprintf(`Ты AI-ассистент разработчика. Репо: %s/%s. Отвечай кратко на русском.`, o, r)
 
-	// Все сообщения в основной чат (без топиков/тредов)
-	taskThreadID := 0
+	phID := b.tg("💭", threadID)
+
+	// Используем Sonnet со стримингом
+	full, err := b.llm.Stream(TierSonnet, system, text, func(partial string) {
+		b.edit(phID, partial+" ▌")
+	})
+
+	if err != nil {
+		log.Printf("chat error: %v", err)
+		b.edit(phID, fmt.Sprintf("❌ %v", err))
+		return
+	}
+
+	b.edit(phID, full)
+
+	// Голосовое сообщение для длинных ответов
+	if len(full) > 300 {
+		go b.sendVoice(removeMarkdown(truncate(full, 500)), threadID)
+	}
+}
+
+func removeMarkdown(text string) string {
+	text = strings.ReplaceAll(text, "```", "")
+	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "__", "")
+	text = strings.ReplaceAll(text, "_", "")
+	text = strings.ReplaceAll(text, "`", "")
+	text = strings.ReplaceAll(text, "> ", "")
+	return text
+}
+
+// ── Task execution ────────────────────────────────────────────
+
+func (b *Bot) runTask(description string, threadID int) {
+	o, r := b.currentRepo()
 
 	taskID := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	task := &Task{
-		ID: taskID, Description: description,
-		Owner: o, Repo: r,
-		Steps:     make(chan Step, 100),
-		StartedAt: time.Now(),
+		ID:          taskID,
+		Description: description,
+		Owner:       o,
+		Repo:        r,
+		Steps:       make(chan Step, 100),
+		StartedAt:   time.Now(),
 	}
+
 	b.tasksMu.Lock()
 	b.tasks[taskID] = task
 	b.tasksMu.Unlock()
 
-	// Создаём живой трекер прогресса
-	pt := NewProgressTracker(b, description, o, r, taskThreadID)
-
-	agent := NewAgent(b.cfg, o, r).WithProgress(pt).WithBot(b, taskThreadID)
+	// Запускаем агента (используется Opus для coding)
+	agent := NewAgent(b.cfg, b.llm, o, r).WithBot(b, threadID)
 	go agent.Run(task)
-	go b.drainSteps(task, pt, taskThreadID)
+	go b.drainSteps(task, threadID)
 }
 
-// drainSteps читает шаги агента и стримит мысли агента в Telegram
-func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
+func (b *Bot) drainSteps(task *Task, threadID int) {
+	var msgID int
 	var prNum int
 	var prURL string
-	var thoughtMsgID int // единое сообщение для стриминга мыслей агента
 
 	for step := range task.Steps {
 		switch step.Type {
-		case StepPlanning:
-			// Стриминг мыслей планировщика (Extended Thinking)
-			text := "🧠 _" + truncate(step.Content, 400) + "_"
-			if thoughtMsgID == 0 {
-				thoughtMsgID = b.tg(text, threadID)
-			} else {
-				b.edit(thoughtMsgID, text)
-			}
-
 		case StepThought:
-			// Улучшенный формат мыслей с иконкой лампочки
-			text := "💡 _" + truncate(step.Content, 300) + "_"
-			if thoughtMsgID == 0 {
-				thoughtMsgID = b.tg(text, threadID)
+			text := "💭 _" + truncate(step.Content, 300) + "_"
+			if msgID == 0 {
+				msgID = b.tg(text, threadID)
 			} else {
-				b.edit(thoughtMsgID, text)
+				b.edit(msgID, text)
 			}
 
 		case StepAction:
-			if thoughtMsgID != 0 {
-				// Визуально отличаем действие от мысли - показываем детали вызова
-				actionText := formatToolCall(step.Content)
-				b.edit(thoughtMsgID, actionText)
-			}
+			text := "⚡ `" + step.Content + "`"
+			b.edit(msgID, text)
 
 		case StepResult:
-			// Отправляем результат выполнения тула как новое сообщение
-			resultText := "✓ _" + truncate(step.Content, 400) + "_"
-			b.tg(resultText, threadID)
-			thoughtMsgID = 0 // сбрасываем для следующей мысли
+			b.tg("✓ _"+truncate(step.Content, 400)+"_", threadID)
+			msgID = 0
 
 		case StepPR:
 			prNum = step.PRNumber
 			prURL = step.PRURL
-			pt.SetPR(prNum, prURL)
-			go b.watchCI(task, prNum, prURL, pt, threadID)
+			b.tg(fmt.Sprintf("🚀 [PR #%d](%s) создан", prNum, prURL), threadID)
+			go b.watchCI(task, prNum, prURL, threadID)
 
 		case StepError:
-			pt.Error(step.Content)
+			b.tg("❌ "+step.Content, threadID)
 			b.removeTask(task.ID)
 
 		case StepDone:
-			pt.Finish()
-			b.sendTaskResult(task, step.Content, prNum, prURL, threadID)
+			elapsed := time.Since(task.StartedAt)
+			result := fmt.Sprintf("✅ Готово за %s\n\n_%s_", fmtDuration(elapsed), step.Content)
+			if prURL != "" {
+				result += fmt.Sprintf("\n\n🔗 [PR #%d](%s)", prNum, prURL)
+			}
+			b.tg(result, threadID)
 			b.removeTask(task.ID)
+
+			// Голосовое резюме
+			if b.cfg.OpenAIKey != "" {
+				voiceText := fmt.Sprintf("Задача выполнена за %s. %s", fmtDuration(elapsed), truncate(step.Content, 200))
+				go b.sendVoice(voiceText, threadID)
+			}
 		}
 	}
 }
 
-func (b *Bot) watchCI(task *Task, prNum int, prURL string, pt *ProgressTracker, threadID int) {
+func (b *Bot) watchCI(task *Task, prNum int, prURL string, threadID int) {
 	gh := NewGitHubClient(b.cfg.GitHubToken, task.Owner, task.Repo)
 
-	// Обновляем прогресс — CI ожидание
-	if pt != nil {
-		pt.StartStep("wait_ci", fmt.Sprintf("PR #%d", prNum))
-	}
-
-	switch gh.WatchChecks(prNum) {
+	status := gh.WatchChecks(prNum)
+	switch status {
 	case "success":
-		if pt != nil {
-			pt.DoneStep(false)
-		}
-		mergeText := fmt.Sprintf("✅ Тесты прошли\n[PR #%d](%s)\n\nМержить?", prNum, prURL)
-		if !b.requestApproval(task.ID+"-merge", mergeText, threadID) {
-			b.tg(fmt.Sprintf("⏸ Мерж отложен → [PR #%d](%s)", prNum, prURL), threadID)
-			b.removeTask(task.ID)
+		msg := fmt.Sprintf("✅ Тесты прошли\n[PR #%d](%s)\n\nСмержить?", prNum, prURL)
+		if !b.requestApproval(task.ID+"-merge", msg, threadID) {
+			b.tg("⏸ Мерж отложен", threadID)
 			return
 		}
 		if err := gh.MergePR(prNum); err != nil {
-			b.tg(fmt.Sprintf("⚠️ Мерж ❌: %v\n🔗 %s", err, prURL), threadID)
+			b.tg(fmt.Sprintf("❌ Мерж failed: %v", err), threadID)
 		} else {
-			if pt != nil {
-				pt.Finish()
-			}
-			b.sendTaskResult(task, "PR смержен", prNum, prURL, threadID)
+			b.tg(fmt.Sprintf("✅ PR #%d смержен", prNum), threadID)
 		}
-		b.removeTask(task.ID)
 
 	case "failure":
-		if pt != nil {
-			pt.DoneStep(true)
-		}
-		log_ := gh.GetFailLog(prNum)
-		b.tg("❌ Тесты:\n```\n"+truncate(log_, 500)+"\n```\nФикшу...", threadID)
-		fix := &Task{
-			ID: task.ID + "-fix", Description: "Fix CI. Log:\n" + log_,
-			Owner: task.Owner, Repo: task.Repo, Branch: task.Branch,
-			Steps:     make(chan Step, 50),
-			StartedAt: time.Now(),
-		}
-		fixPT := NewProgressTracker(b, "Fix CI tests", task.Owner, task.Repo, threadID)
-		go NewAgent(b.cfg, task.Owner, task.Repo).WithProgress(fixPT).WithBot(b, threadID).Run(fix)
-		go b.drainSteps(fix, fixPT, threadID)
+		logs := gh.GetFailLog(prNum)
+		b.tg("❌ Тесты:\n```\n"+truncate(logs, 500)+"\n```", threadID)
 
 	case "timeout":
-		if pt != nil {
-			pt.DoneStep(true)
-		}
 		b.tg("⏰ CI timeout\n🔗 "+prURL, threadID)
 	}
 }
 
-func (b *Bot) sendTaskResult(task *Task, summary string, prNum int, prURL string, threadID int) {
-	duration := time.Since(task.StartedAt)
+// ── PR management ─────────────────────────────────────────────
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("✅ *Задача завершена* за %s\n\n", fmtDuration(duration)))
-	sb.WriteString(fmt.Sprintf("📝 *%s*\n\n", truncate(task.Description, 100)))
-
-	if prURL != "" {
-		sb.WriteString(fmt.Sprintf("🔗 [PR #%d](%s) смержен\n\n", prNum, prURL))
-	}
-
-	if summary != "" && summary != "PR смержен автоматически" {
-		sb.WriteString("💬 _" + truncate(summary, 300) + "_\n\n")
-	}
-
-	// Ссылка на добавление в Google Calendar
-	if prURL != "" || summary != "" {
-		ev := buildTaskEvent(task.Description, task.Owner, task.Repo, prURL, duration)
-		calLink := GoogleCalendarLink(ev)
-		sb.WriteString(fmt.Sprintf("📅 [Добавить в календарь](%s)", calLink))
-	}
-
-	b.tg(sb.String(), threadID)
-
-	// Голосовое резюме
-	if b.cfg.OpenAIKey != "" {
-		text := fmt.Sprintf("Задача выполнена за %s. %s", fmtDuration(duration), truncate(summary, 200))
-		go b.sendVoice(text, threadID)
-	}
-}
-
-// ── Reminders ─────────────────────────────────────────────────
-
-func (b *Bot) handleReminderNLP(text string, threadID int) {
-	phID := b.tg("⏰ _разбираю..._", threadID)
-	raw, err := b.callHaiku(
-		`Parse reminder from Russian. JSON only:
-{"text":"what to remind","minutes":N}`,
-		text)
-	if err != nil {
-		b.edit(phID, "❌ "+err.Error())
-		return
-	}
-	if i := strings.Index(raw, "{"); i >= 0 {
-		raw = raw[i:]
-	}
-	if j := strings.LastIndex(raw, "}"); j >= 0 {
-		raw = raw[:j+1]
-	}
-	var parsed struct {
-		Text    string `json:"text"`
-		Minutes int    `json:"minutes"`
-	}
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed.Minutes <= 0 {
-		b.edit(phID, "")
-		b.chat(text, threadID)
-		return
-	}
-	at := time.Now().Add(time.Duration(parsed.Minutes) * time.Minute)
-	id := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	b.remindersMu.Lock()
-	b.reminders = append(b.reminders, Reminder{ID: id, Text: parsed.Text, At: at, ThreadID: threadID})
-	b.remindersMu.Unlock()
-	b.edit(phID, fmt.Sprintf("⏰ Напомню: _%s_\n🕐 %s", parsed.Text, at.Format("02 Jan 15:04")))
-}
-
-func (b *Bot) addReminder(arg string, threadID int) {
-	at, text := parseReminderCmd(arg)
-	if at.IsZero() {
-		b.tg("❌ Пример: `/remind митинг через 30 минут`", threadID)
-		return
-	}
-	id := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	b.remindersMu.Lock()
-	b.reminders = append(b.reminders, Reminder{ID: id, Text: text, At: at, ThreadID: threadID})
-	b.remindersMu.Unlock()
-	b.tg(fmt.Sprintf("⏰ Напомню: _%s_\n🕐 %s", text, at.Format("02 Jan 15:04")), threadID)
-}
-
-func parseReminderCmd(arg string) (time.Time, string) {
-	lower := strings.ToLower(arg)
-	var minutes int
-	if i := strings.Index(lower, "через "); i >= 0 {
-		parts := strings.Fields(lower[i+6:])
-		if len(parts) >= 2 {
-			n, _ := strconv.Atoi(parts[0])
-			switch {
-			case strings.Contains(parts[1], "мин"):
-				minutes = n
-			case strings.Contains(parts[1], "час"):
-				minutes = n * 60
-			case strings.Contains(parts[1], "ден"), strings.Contains(parts[1], "сут"):
-				minutes = n * 1440
-			}
-		}
-	}
-	if strings.Contains(lower, "завтра") && minutes == 0 {
-		minutes = 1440
-	}
-	if minutes == 0 {
-		return time.Time{}, ""
-	}
-	text := arg
-	if i := strings.Index(strings.ToLower(text), " через "); i > 0 {
-		text = text[:i]
-	}
-	return time.Now().Add(time.Duration(minutes) * time.Minute), strings.TrimSpace(text)
-}
-
-func (b *Bot) reminderLoop() {
-	for {
-		time.Sleep(30 * time.Second)
-		now := time.Now()
-		b.remindersMu.Lock()
-		var keep []Reminder
-		for _, r := range b.reminders {
-			if now.After(r.At) {
-				b.tg("⏰ *Напоминание:* "+r.Text, r.ThreadID)
-			} else {
-				keep = append(keep, r)
-			}
-		}
-		b.reminders = keep
-		b.remindersMu.Unlock()
-	}
-}
-
-func (b *Bot) sendReminders(threadID int) {
-	b.remindersMu.Lock()
-	defer b.remindersMu.Unlock()
-	if len(b.reminders) == 0 {
-		b.tg("🔕 Нет напоминалок", threadID)
-		return
-	}
-	var sb strings.Builder
-	sb.WriteString("⏰ *Напоминалки:*\n")
-	for _, r := range b.reminders {
-		sb.WriteString(fmt.Sprintf("• %s _(в %s)_\n", r.Text, r.At.Format("02 Jan 15:04")))
-	}
-	b.tg(sb.String(), threadID)
-}
-
-// ── Commands ──────────────────────────────────────────────────
-
-func (b *Bot) setRepo(arg string, threadID int) {
-	p := strings.Split(strings.TrimSpace(arg), "/")
-	if len(p) != 2 {
-		b.tg("❌ Формат: `/repo owner/name`", threadID)
-		return
-	}
-	b.repoMu.Lock()
-	b.owner, b.repo = p[0], p[1]
-	b.repoMu.Unlock()
-	b.tg(fmt.Sprintf("✅ Репо: `%s/%s`", p[0], p[1]), threadID)
-}
-
-func (b *Bot) sendStatus(threadID int) {
-	o, r := b.currentRepo()
-	b.tasksMu.Lock()
-	n := len(b.tasks)
-	b.tasksMu.Unlock()
-	b.remindersMu.Lock()
-	nr := len(b.reminders)
-	b.remindersMu.Unlock()
-	b.tg(fmt.Sprintf("📊 Репо: `%s/%s` | Задач: %d | Напоминалок: %d", o, r, n, nr), threadID)
-}
-
-func (b *Bot) sendVersion(threadID int) {
-	version := getVersion()
-	b.tg(version, threadID)
-}
-
-func (b *Bot) sendPRs(threadID int) {
-	b.handleListPRs(threadID)
-}
-
-// handleListPRs - показывает список открытых PR с кнопками
-func (b *Bot) handleListPRs(threadID int) {
+func (b *Bot) listPRs(threadID int) {
 	o, r := b.currentRepo()
 	prs, err := NewGitHubClient(b.cfg.GitHubToken, o, r).ListPRs()
 	if err != nil {
@@ -807,7 +400,7 @@ func (b *Bot) handleListPRs(threadID int) {
 		sb.WriteString(fmt.Sprintf("%d. [#%d](%s) - %s\n", i+1, pr.Number, pr.URL, pr.Title))
 	}
 
-	// Создаем кнопки для каждого PR (по 2 кнопки в ряд)
+	// Кнопки для каждого PR
 	var keyboard [][]map[string]any
 	for _, pr := range prs {
 		row := []map[string]any{
@@ -820,20 +413,18 @@ func (b *Bot) handleListPRs(threadID int) {
 	b.sendWithButtons(sb.String(), keyboard, threadID)
 }
 
-// handleMergePR - мерджит указанный PR с подтверждением
-func (b *Bot) handleMergePR(prNum int, threadID int) {
+func (b *Bot) mergePR(prNum int, threadID int) {
 	o, r := b.currentRepo()
 	gh := NewGitHubClient(b.cfg.GitHubToken, o, r)
 
-	// Проверяем что PR существует
 	prs, err := gh.ListPRs()
 	if err != nil {
 		b.tg("❌ "+err.Error(), threadID)
 		return
 	}
 
-	found := false
 	var prTitle string
+	found := false
 	for _, pr := range prs {
 		if pr.Number == prNum {
 			found = true
@@ -843,11 +434,10 @@ func (b *Bot) handleMergePR(prNum int, threadID int) {
 	}
 
 	if !found {
-		b.tg(fmt.Sprintf("❌ PR #%d не найден среди открытых PR", prNum), threadID)
+		b.tg(fmt.Sprintf("❌ PR #%d не найден", prNum), threadID)
 		return
 	}
 
-	// Подтверждение с кнопками
 	msg := fmt.Sprintf("🔀 Смержить PR #%d?\n\n*%s*", prNum, prTitle)
 	taskID := fmt.Sprintf("merge-pr-%d-%d", prNum, time.Now().Unix())
 
@@ -856,29 +446,26 @@ func (b *Bot) handleMergePR(prNum int, threadID int) {
 		return
 	}
 
-	// Мерджим
 	if err := gh.MergePR(prNum); err != nil {
-		b.tg(fmt.Sprintf("❌ Ошибка мерджа: %v", err), threadID)
+		b.tg(fmt.Sprintf("❌ %v", err), threadID)
 		return
 	}
 
-	b.tg(fmt.Sprintf("✅ PR #%d смержен!\n\n_%s_", prNum, prTitle), threadID)
+	b.tg(fmt.Sprintf("✅ PR #%d смержен", prNum), threadID)
 }
 
-// handleClosePR - закрывает PR без мерджа
-func (b *Bot) handleClosePR(prNum int, threadID int) {
+func (b *Bot) closePR(prNum int, threadID int) {
 	o, r := b.currentRepo()
 	gh := NewGitHubClient(b.cfg.GitHubToken, o, r)
 
-	// Проверяем что PR существует
 	prs, err := gh.ListPRs()
 	if err != nil {
 		b.tg("❌ "+err.Error(), threadID)
 		return
 	}
 
-	found := false
 	var prTitle string
+	found := false
 	for _, pr := range prs {
 		if pr.Number == prNum {
 			found = true
@@ -888,60 +475,31 @@ func (b *Bot) handleClosePR(prNum int, threadID int) {
 	}
 
 	if !found {
-		b.tg(fmt.Sprintf("❌ PR #%d не найден среди открытых PR", prNum), threadID)
+		b.tg(fmt.Sprintf("❌ PR #%d не найден", prNum), threadID)
 		return
 	}
 
-	// Подтверждение
-	msg := fmt.Sprintf("🗑 Закрыть PR #%d без мерджа?\n\n*%s*", prNum, prTitle)
+	msg := fmt.Sprintf("🗑 Закрыть PR #%d?\n\n*%s*", prNum, prTitle)
 	taskID := fmt.Sprintf("close-pr-%d-%d", prNum, time.Now().Unix())
 
 	if !b.requestApproval(taskID, msg, threadID) {
-		b.tg("⏸ Закрытие отменено", threadID)
+		b.tg("⏸ Отменено", threadID)
 		return
 	}
 
-	// Закрываем
 	if err := gh.ClosePR(prNum); err != nil {
-		b.tg(fmt.Sprintf("❌ Ошибка закрытия: %v", err), threadID)
+		b.tg(fmt.Sprintf("❌ %v", err), threadID)
 		return
 	}
 
-	b.tg(fmt.Sprintf("🗑 PR #%d закрыт\n\n_%s_", prNum, prTitle), threadID)
+	b.tg(fmt.Sprintf("🗑 PR #%d закрыт", prNum), threadID)
 }
 
-func (b *Bot) sendTasks(threadID int) {
-	b.tasksMu.Lock()
-	defer b.tasksMu.Unlock()
-	if len(b.tasks) == 0 {
-		b.tg("😴 Нет активных задач", threadID)
-		return
-	}
-	var sb strings.Builder
-	sb.WriteString("⚙️ *Задачи:*\n")
-	for id, t := range b.tasks {
-		sb.WriteString(fmt.Sprintf("• `%s` — %s\n", id, truncate(t.Description, 50)))
-	}
-	b.tg(sb.String(), threadID)
-}
-
-func (b *Bot) cancelTask(id string, threadID int) {
-	b.tasksMu.Lock()
-	t, ok := b.tasks[id]
-	if ok {
-		close(t.Steps)
-		delete(b.tasks, id)
-	}
-	b.tasksMu.Unlock()
-	if ok {
-		b.tg(fmt.Sprintf("🛑 `%s` отменена", id), threadID)
-	} else {
-		b.tg("❓ Задача не найдена", threadID)
-	}
-}
+// ── Callbacks ─────────────────────────────────────────────────
 
 func (b *Bot) handleCallback(q *tgbotapi.CallbackQuery) {
 	b.api.Request(tgbotapi.NewCallback(q.ID, ""))
+
 	switch {
 	case strings.HasPrefix(q.Data, "approve:"):
 		b.resolveApproval(strings.TrimPrefix(q.Data, "approve:"), true)
@@ -949,19 +507,18 @@ func (b *Bot) handleCallback(q *tgbotapi.CallbackQuery) {
 		b.resolveApproval(strings.TrimPrefix(q.Data, "reject:"), false)
 	case strings.HasPrefix(q.Data, "merge:"):
 		n, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "merge:"))
-		go b.handleMergePR(n, 0)
+		go b.mergePR(n, 0)
 	case strings.HasPrefix(q.Data, "close:"):
 		n, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "close:"))
-		go b.handleClosePR(n, 0)
+		go b.closePR(n, 0)
 	}
 }
 
-// requestApproval отправляет кнопки и блокирует горутину агента до ответа пользователя
 func (b *Bot) requestApproval(taskID, text string, threadID int) bool {
 	ch := make(chan bool, 1)
-	b.approvalsMu.Lock()
+	b.tasksMu.Lock()
 	b.approvals[taskID] = ch
-	b.approvalsMu.Unlock()
+	b.tasksMu.Unlock()
 
 	b.sendWithButtons(text, [][]map[string]any{
 		{
@@ -980,66 +537,55 @@ func (b *Bot) requestApproval(taskID, text string, threadID int) bool {
 }
 
 func (b *Bot) resolveApproval(taskID string, approved bool) {
-	b.approvalsMu.Lock()
+	b.tasksMu.Lock()
 	ch := b.approvals[taskID]
 	delete(b.approvals, taskID)
-	b.approvalsMu.Unlock()
+	b.tasksMu.Unlock()
 	if ch != nil {
 		ch <- approved
 	}
 }
 
-// ── Helpers ───────────────────────────────────────────────────
+// ── Commands ──────────────────────────────────────────────────
+
+func (b *Bot) setRepo(arg string, threadID int) {
+	parts := strings.Split(strings.TrimSpace(arg), "/")
+	if len(parts) != 2 {
+		b.tg("❌ Формат: `/repo owner/name`", threadID)
+		return
+	}
+	b.repoMu.Lock()
+	b.owner, b.repo = parts[0], parts[1]
+	b.repoMu.Unlock()
+	b.tg(fmt.Sprintf("✅ Репо: `%s/%s`", parts[0], parts[1]), threadID)
+}
+
+func (b *Bot) sendStatus(threadID int) {
+	o, r := b.currentRepo()
+	b.tasksMu.Lock()
+	n := len(b.tasks)
+	b.tasksMu.Unlock()
+	b.tg(fmt.Sprintf("📊 Репо: `%s/%s` | Задач: %d", o, r, n), threadID)
+}
+
+func (b *Bot) helpText() string {
+	o, r := b.currentRepo()
+	return fmt.Sprintf(`🤖 *claude-tg*
+Репо: `+"`%s/%s`"+`
+
+Просто пиши или говори:
+— задачу → агент создаст PR
+— вопрос → чат с AI
+— "покажи PR" → список PR
+
+*Команды:*
+`+"`/repo owner/name`"+` | `+"`/prs`"+` | `+"`/status`", o, r)
+}
 
 func (b *Bot) currentRepo() (string, string) {
 	b.repoMu.RLock()
 	defer b.repoMu.RUnlock()
 	return b.owner, b.repo
-}
-
-func (b *Bot) checkAPIKeys() {
-	// Проверка GitHub токена
-	if b.cfg.GitHubToken == "" {
-		log.Printf("⚠️  WARNING: GITHUB_TOKEN not set - PR/repo operations will fail")
-		log.Printf("   Get token: https://github.com/settings/tokens/new")
-	} else {
-		gh := NewGitHubClient(b.cfg.GitHubToken, "test", "test")
-		if login, err := gh.ValidateToken(); err != nil {
-			log.Printf("❌ GitHub token INVALID: %v", err)
-			log.Printf("   Update GITHUB_TOKEN in .env: https://github.com/settings/tokens")
-		} else {
-			log.Printf("✅ GitHub: authenticated as @%s", login)
-		}
-	}
-
-	// Проверка LLM ключей
-	provider := b.cfg.LLMProvider
-	hasKey := false
-
-	switch provider {
-	case "claude":
-		hasKey = b.cfg.AnthropicKey != ""
-		if !hasKey {
-			log.Printf("⚠️  WARNING: LLM_PROVIDER=claude but ANTHROPIC_API_KEY not set")
-			log.Printf("   Chat mode will not work. Get key: https://console.anthropic.com/settings/keys")
-		} else {
-			log.Printf("✅ LLM: Claude (Anthropic API key configured)")
-		}
-	case "deepseek":
-		hasKey = b.cfg.DeepSeekKey != ""
-		if !hasKey {
-			log.Printf("⚠️  WARNING: LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY not set")
-			log.Printf("   Chat mode will not work. Get key: https://platform.deepseek.com")
-		} else {
-			log.Printf("✅ LLM: DeepSeek (API key configured)")
-		}
-	default:
-		log.Printf("⚠️  WARNING: Unknown LLM_PROVIDER=%s", provider)
-	}
-
-	if !hasKey {
-		log.Printf("💡 To enable chat: set %s_API_KEY in .env", strings.ToUpper(provider))
-	}
 }
 
 func (b *Bot) removeTask(id string) {
@@ -1048,78 +594,102 @@ func (b *Bot) removeTask(id string) {
 	b.tasksMu.Unlock()
 }
 
+// ── Telegram helpers ──────────────────────────────────────────
+
 func (b *Bot) tg(text string, threadID int) int {
-	return b.sendMessageRaw(text, threadID)
+	msg := tgbotapi.NewMessage(b.chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+	// TODO: add threadID support via raw API
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("send error: %v", err)
+		return 0
+	}
+	return sent.MessageID
 }
 
 func (b *Bot) edit(msgID int, text string) {
 	if msgID == 0 || text == "" {
 		return
 	}
-	b.editRaw(msgID, text)
+	msg := tgbotapi.NewEditMessageText(b.chatID, msgID, text)
+	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+	b.api.Send(msg)
 }
 
-func (b *Bot) helpText() string {
-	o, r := b.currentRepo()
-	return fmt.Sprintf("🤖 *claude-tg*\nРепо: `%s/%s`\n\n"+
-		"Пиши или говори:\n"+
-		"— задача → живой прогресс в треде + PR + календарь\n"+
-		"— вопрос → стриминг ответа\n"+
-		"— напомни → таймер\n"+
-		"— поменяй аватарку → меняет фото\n\n"+
-		"Каждый репо получает свой тред в группе автоматически.\n\n"+
-		"*Команды:*\n"+
-		"`/repo owner/name` | `/prs` | `/tasks`\n"+
-		"`/reminders` | `/status` | `/version`", o, r)
+func (b *Bot) sendWithButtons(text string, keyboard [][]map[string]any, threadID int) int {
+	var inlineKeyboard [][]tgbotapi.InlineKeyboardButton
+	for _, row := range keyboard {
+		var btnRow []tgbotapi.InlineKeyboardButton
+		for _, btn := range row {
+			btnRow = append(btnRow, tgbotapi.NewInlineKeyboardButtonData(
+				btn["text"].(string),
+				btn["callback_data"].(string),
+			))
+		}
+		inlineKeyboard = append(inlineKeyboard, btnRow)
+	}
+
+	msg := tgbotapi.NewMessage(b.chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(inlineKeyboard...)
+	// TODO: add threadID support via raw API
+
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("send error: %v", err)
+		return 0
+	}
+	return sent.MessageID
 }
 
-type Button struct{ Label, Data string }
-
-// formatToolCall - форматирует вызов тула с иконкой и параметрами
-func formatToolCall(toolCall string) string {
-	// toolCall имеет формат "tool_name(args)"
-	// Например: "read_file(src/App.tsx)" или "search_code(useEffect)"
-
-	icons := map[string]string{
-		"read_file":      "📖",
-		"write_file":     "✏️",
-		"list_files":     "📁",
-		"search_code":    "🔍",
-		"search_history": "🔎",
-		"get_summary":    "📋",
-		"get_user_repos": "📂",
-		"set_avatar":     "🎨",
-		"manage_topics":  "📌",
-		"spawn_subagent": "🤖",
-		"orchestrate":    "🎯",
-		"create_pr":      "🚀",
-		"done":           "✅",
-	}
-
-	// Извлекаем имя тула и аргументы
-	parts := strings.SplitN(toolCall, "(", 2)
-	if len(parts) < 2 {
-		return "⚡ _" + truncate(toolCall, 300) + "_"
-	}
-
-	toolName := parts[0]
-	args := strings.TrimSuffix(parts[1], ")")
-
-	icon := icons[toolName]
-	if icon == "" {
-		icon = "⚙️"
-	}
-
-	// Форматируем красиво с параметрами
-	if args != "" {
-		return fmt.Sprintf("%s `%s`\n_→ %s_", icon, toolName, truncate(args, 250))
-	}
-	return fmt.Sprintf("%s `%s`", icon, toolName)
-}
+// ── Helpers ───────────────────────────────────────────────────
 
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+func fmtDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	if s == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+func extractPRNumber(text string) int {
+	text = strings.ToLower(text)
+	for i := 0; i < len(text); i++ {
+		if text[i] == '#' && i+1 < len(text) {
+			var num int
+			fmt.Sscanf(text[i+1:], "%d", &num)
+			if num > 0 {
+				return num
+			}
+		}
+	}
+
+	// Словесные числа
+	words := map[string]int{
+		"первый": 1, "второй": 2, "третий": 3, "четвертый": 4,
+		"пятый": 5, "шестой": 6, "седьмой": 7, "восьмой": 8,
+	}
+	for word, num := range words {
+		if strings.Contains(text, word) {
+			return num
+		}
+	}
+
+	return 0
 }

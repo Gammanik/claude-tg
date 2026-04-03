@@ -1,28 +1,21 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 type StepType string
 
 const (
-	StepThought  StepType = "thought"
-	StepPlanning StepType = "planning" // мысли планировщика (Extended Thinking)
-	StepAction   StepType = "action"
-	StepResult   StepType = "result" // результат выполнения тула
-	StepPR       StepType = "pr"
-	StepError    StepType = "error"
-	StepDone     StepType = "done"
+	StepThought StepType = "thought"
+	StepAction  StepType = "action"
+	StepResult  StepType = "result"
+	StepPR      StepType = "pr"
+	StepError   StepType = "error"
+	StepDone    StepType = "done"
 )
 
 type Step struct {
@@ -43,21 +36,21 @@ type Task struct {
 
 type Agent struct {
 	cfg         Config
+	llm         *LLMClient
 	gh          *GitHubClient
 	owner, repo string
-	progress    *ProgressTracker // может быть nil
-	bot         *Bot             // для создания прогресс-трекеров суб-агентов
+	bot         *Bot
 	threadID    int
 }
 
-func NewAgent(cfg Config, owner, repo string) *Agent {
-	return &Agent{cfg: cfg, gh: NewGitHubClient(cfg.GitHubToken, owner, repo),
-		owner: owner, repo: repo}
-}
-
-func (a *Agent) WithProgress(pt *ProgressTracker) *Agent {
-	a.progress = pt
-	return a
+func NewAgent(cfg Config, llm *LLMClient, owner, repo string) *Agent {
+	return &Agent{
+		cfg:   cfg,
+		llm:   llm,
+		gh:    NewGitHubClient(cfg.GitHubToken, owner, repo),
+		owner: owner,
+		repo:  repo,
+	}
 }
 
 func (a *Agent) WithBot(bot *Bot, threadID int) *Agent {
@@ -67,400 +60,99 @@ func (a *Agent) WithBot(bot *Bot, threadID int) *Agent {
 }
 
 func (a *Agent) Run(task *Task) {
-	task.StartedAt = time.Now()
+	defer close(task.Steps)
 	defer func() {
 		if r := recover(); r != nil {
 			task.Steps <- Step{Type: StepError, Content: fmt.Sprintf("panic: %v", r)}
-			close(task.Steps)
 		}
 	}()
-	defer close(task.Steps)
-
-	// Проверяем нужно ли использовать планировщик
-	if !a.cfg.UsePlanner {
-		// Старое поведение - простой ReAct loop
-		a.runReActLoop(task)
-		return
-	}
-
-	// НОВОЕ ПОВЕДЕНИЕ: ДВУХФАЗНАЯ АРХИТЕКТУРА С ПЛАНИРОВЩИКОМ
-
-	// ФАЗА 1: ПЛАНИРОВАНИЕ
-	a.think("Анализирую задачу и создаю план...", task)
-
-	// Трекер для планирования
-	if a.progress != nil {
-		a.progress.StartPlanning()
-	}
-
-	ctx := a.buildContext(task.Description)
-	planner := NewPlanner(a.cfg, a.owner, a.repo, a.bot)
-
-	plan, err := planner.CreatePlan(task, ctx, func(thinking string) {
-		// Streaming thinking от планировщика
-		task.Steps <- Step{Type: StepPlanning, Content: thinking}
-	})
-
-	if err != nil {
-		// Fallback на старое поведение при ошибке планирования
-		task.Steps <- Step{Type: StepThought, Content: "Planning failed, using standard approach: " + err.Error()}
-		a.runReActLoop(task)
-		return
-	}
-
-	// Завершаем планирование в трекере
-	if a.progress != nil {
-		a.progress.FinishPlanning(plan)
-	}
-
-	// Показываем финальный план
-	task.Steps <- Step{Type: StepThought, Content: plan.Format()}
 
 	// Создаём ветку
 	branch := makeBranch(task.Description, task.ID)
-	if task.Branch != "" {
-		branch = task.Branch
-	}
+	task.Steps <- Step{Type: StepThought, Content: "Создаю ветку " + branch}
 
-	a.act("git checkout -b "+branch, task)
-	if task.Branch == "" {
-		if err := a.gh.CreateBranch(branch); err != nil {
-			task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
-			return
-		}
+	if err := a.gh.CreateBranch(branch); err != nil {
+		task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
+		return
 	}
 	task.Branch = branch
-	if a.progress != nil {
-		a.progress.SetBranch(branch)
-	}
 
-	// ФАЗА 2: ВЫПОЛНЕНИЕ С ПЛАНОМ
-	err = a.ExecuteWithPlan(task, plan, branch)
-	if err != nil {
-		// ФАЗА 3: ПЕРЕPLANИРОВАНИЕ (максимум 2 попытки)
-		for attempt := 0; attempt < 2; attempt++ {
-			a.think(fmt.Sprintf("Произошла ошибка, переplanирую (попытка %d/2)...", attempt+1), task)
-			newPlan, replanErr := planner.Replan(task, plan, err.Error())
-			if replanErr != nil {
-				task.Steps <- Step{Type: StepError, Content: "Replan failed: " + replanErr.Error()}
-				if a.progress != nil {
-					a.progress.Error("Replan failed: " + replanErr.Error())
-				}
-				return
-			}
+	// Читаем контекст репо
+	task.Steps <- Step{Type: StepThought, Content: "Читаю структуру репо..."}
+	ctx := a.buildContext()
 
-			// Показываем новый план
-			task.Steps <- Step{Type: StepThought, Content: "New plan:\n" + newPlan.Format()}
-
-			// Пробуем выполнить новый план
-			err = a.ExecuteWithPlan(task, newPlan, branch)
-			if err == nil {
-				return // успех
-			}
-		}
-
-		// Если все попытки replan исчерпаны
-		task.Steps <- Step{Type: StepError, Content: "Failed after replanning: " + err.Error()}
-		if a.progress != nil {
-			a.progress.Error("Failed after replanning")
-		}
-	}
-}
-
-// runReActLoop - старый ReAct loop без планировщика (для совместимости)
-func (a *Agent) runReActLoop(task *Task) {
-	a.think("Читаю структуру репо...", task)
-	ctx := a.buildContext(task.Description)
-
-	// Создаём ветку
-	branch := makeBranch(task.Description, task.ID)
-	if task.Branch != "" {
-		branch = task.Branch
-	}
-
-	a.act("git checkout -b "+branch, task)
-	if task.Branch == "" {
-		if err := a.gh.CreateBranch(branch); err != nil {
-			task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
-			return
-		}
-	}
-	task.Branch = branch
-	if a.progress != nil {
-		a.progress.SetBranch(branch)
-	}
-
-	// ReAct loop
+	// ReAct loop с Opus (для coding задач)
 	messages := []msg{
 		{Role: "system", Content: systemPrompt(a.owner, a.repo, ctx)},
 		{Role: "user", Content: task.Description},
 	}
 
 	for i := 0; i < 25; i++ {
-		// Проверяем лимиты перед вызовом
-		if a.bot != nil && a.bot.limits != nil {
-			estimatedTokens := 1000
-			ok, warning := a.bot.limits.CheckLimit(estimatedTokens)
-			if !ok {
-				task.Steps <- Step{Type: StepError, Content: warning}
-				if a.progress != nil {
-					a.progress.Error(warning)
-				}
-				return
-			}
-			if warning != "" {
-				task.Steps <- Step{Type: StepThought, Content: warning}
-			}
-		}
-
-		resp, err := a.llm(messages)
+		resp, err := a.llm.Call(TierOpus, messages[0].Content, messages[len(messages)-1].Content)
 		if err != nil {
 			task.Steps <- Step{Type: StepError, Content: "LLM: " + err.Error()}
 			return
 		}
 		messages = append(messages, msg{Role: "assistant", Content: resp})
 
-		// Передаем usage в progress tracker и обновляем лимиты
-		if a.progress != nil {
-			a.progress.AddTokenUsage(lastUsage.Input, lastUsage.Output, lastUsage.CacheRead, lastUsage.CacheWrite)
-		}
-		if a.bot != nil && a.bot.limits != nil {
-			totalTokens := lastUsage.Input + lastUsage.Output
-			a.bot.limits.CheckLimit(totalTokens)
-		}
-
+		// Извлекаем мысль
 		if t := extractThought(resp); t != "" {
-			a.think(t, task)
+			task.Steps <- Step{Type: StepThought, Content: t}
 		}
 
+		// Парсим actions
 		actions := parseActions(resp)
 		if len(actions) == 0 {
 			task.Steps <- Step{Type: StepDone, Content: resp}
-			if a.progress != nil {
-				a.progress.Finish()
-			}
 			return
 		}
 
-		// Выполняем actions параллельно с учетом зависимостей
-		results, prNum, prURL, done := a.executeActionsParallel(actions, branch, task)
+		// Выполняем actions
+		results, prNum, prURL, done := a.executeActions(actions, branch, task)
 
 		if prNum > 0 {
 			task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
-			if a.progress != nil {
-				a.progress.SetPR(prNum, prURL)
-			}
 			return
 		}
 		if done {
 			task.Steps <- Step{Type: StepDone, Content: results}
-			if a.progress != nil {
-				a.progress.Finish()
-			}
 			return
 		}
 
-		// Собираем результаты для передачи в LLM
+		// Добавляем результаты в контекст
 		messages = append(messages, msg{Role: "user", Content: "Tool results:\n" + results})
 	}
-	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов"}
+
+	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов (25)"}
 }
 
-// ExecuteWithPlan выполняет план используя ReAct loop с guidance от плана
-func (a *Agent) ExecuteWithPlan(task *Task, plan *TaskPlan, branch string) error {
-	messages := []msg{
-		{Role: "system", Content: systemPromptWithPlan(a.owner, a.repo, plan)},
-		{Role: "user", Content: task.Description},
+func (a *Agent) executeActions(actions []action, branch string, task *Task) (results string, prNum int, prURL string, done bool) {
+	var sb strings.Builder
+
+	for _, act := range actions {
+		task.Steps <- Step{Type: StepAction, Content: fmt.Sprintf("%s(%s)", act.Tool, shortArgs(act.Args))}
+
+		result, pNum, pURL, isDone, errMsg := a.execute(act, branch)
+
+		if pNum > 0 {
+			return result, pNum, pURL, false
+		}
+		if isDone {
+			return result, 0, "", true
+		}
+		if errMsg != "" {
+			sb.WriteString(fmt.Sprintf("[%s]: ERROR: %s\n", act.Tool, errMsg))
+			task.Steps <- Step{Type: StepResult, Content: "ERROR: " + errMsg}
+		} else {
+			sb.WriteString(fmt.Sprintf("[%s]: %s\n", act.Tool, truncate(result, 200)))
+			task.Steps <- Step{Type: StepResult, Content: truncate(result, 300)}
+		}
 	}
 
-	currentPhase := 0
-
-	for i := 0; i < 25; i++ {
-		// Проверяем лимиты перед вызовом
-		if a.bot != nil && a.bot.limits != nil {
-			estimatedTokens := 1000
-			ok, warning := a.bot.limits.CheckLimit(estimatedTokens)
-			if !ok {
-				return fmt.Errorf("usage limit exceeded: %s", warning)
-			}
-			if warning != "" {
-				task.Steps <- Step{Type: StepThought, Content: warning}
-			}
-		}
-
-		resp, err := a.llm(messages)
-		if err != nil {
-			return fmt.Errorf("LLM error: %w", err)
-		}
-		messages = append(messages, msg{Role: "assistant", Content: resp})
-
-		// Передаем usage в progress tracker и обновляем лимиты
-		if a.progress != nil {
-			a.progress.AddTokenUsage(lastUsage.Input, lastUsage.Output, lastUsage.CacheRead, lastUsage.CacheWrite)
-		}
-		if a.bot != nil && a.bot.limits != nil {
-			totalTokens := lastUsage.Input + lastUsage.Output
-			a.bot.limits.CheckLimit(totalTokens)
-		}
-
-		if t := extractThought(resp); t != "" {
-			a.think(t, task)
-		}
-
-		actions := parseActions(resp)
-		if len(actions) == 0 {
-			task.Steps <- Step{Type: StepDone, Content: resp}
-			if a.progress != nil {
-				a.progress.Finish()
-			}
-			return nil
-		}
-
-		// Проверяем соответствие плану
-		if !plan.ValidateActions(currentPhase, actions) {
-			a.think("Actions не полностью соответствуют плану, но продолжаю выполнение...", task)
-		}
-
-		// Выполняем actions параллельно с учетом зависимостей
-		results, prNum, prURL, done := a.executeActionsParallel(actions, branch, task)
-
-		if prNum > 0 {
-			task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
-			if a.progress != nil {
-				a.progress.SetPR(prNum, prURL)
-			}
-			return nil
-		}
-		if done {
-			task.Steps <- Step{Type: StepDone, Content: results}
-			if a.progress != nil {
-				a.progress.Finish()
-			}
-			return nil
-		}
-
-		// Собираем результаты для передачи в LLM
-		messages = append(messages, msg{Role: "user", Content: "Tool results:\n" + results})
-		currentPhase++
-	}
-
-	return fmt.Errorf("превышен лимит шагов (25)")
+	return sb.String(), 0, "", false
 }
 
-func (a *Agent) think(content string, task *Task) {
-	task.Steps <- Step{Type: StepThought, Content: content}
-}
-
-func (a *Agent) act(label string, task *Task) {
-	task.Steps <- Step{Type: StepAction, Content: label}
-}
-
-// executeActionsParallel - выполняет actions параллельно с учетом зависимостей
-func (a *Agent) executeActionsParallel(actions []action, branch string, task *Task) (results string, prNum int, prURL string, done bool) {
-	if len(actions) == 0 {
-		return "", 0, "", false
-	}
-
-	// Строим DAG
-	dag := NewActionDAG(actions)
-
-	// Логируем DAG для дебага
-	if a.bot != nil {
-		dagInfo := dag.PrintDAG()
-		task.Steps <- Step{Type: StepThought, Content: "Execution plan:\n" + dagInfo}
-	}
-
-	// Параллельное выполнение
-	type execResult struct {
-		nodeID int
-		result string
-		prNum  int
-		prURL  string
-		done   bool
-		err    string
-	}
-
-	resultChan := make(chan execResult, len(actions))
-	var wg sync.WaitGroup
-
-	// Выполняем actions волнами (по уровням зависимостей)
-	for !dag.AllCompleted() {
-		executable := dag.GetExecutableNodes()
-		if len(executable) == 0 {
-			break // deadlock или ошибка
-		}
-
-		// Запускаем все executable nodes параллельно
-		for _, nodeID := range executable {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-
-				node := &dag.Nodes[id]
-				result, pNum, pURL, isDone, errMsg := a.execute(node.Action, branch, task)
-
-				resultChan <- execResult{
-					nodeID: id,
-					result: result,
-					prNum:  pNum,
-					prURL:  pURL,
-					done:   isDone,
-					err:    errMsg,
-				}
-			}(nodeID)
-		}
-
-		// Ждем завершения этой волны
-		wg.Wait()
-
-		// Собираем результаты
-		for i := 0; i < len(executable); i++ {
-			res := <-resultChan
-			dag.MarkCompleted(res.nodeID, res.result, res.err)
-
-			// Если создали PR - возвращаем сразу
-			if res.prNum > 0 {
-				return res.result, res.prNum, res.prURL, false
-			}
-
-			// Если done - возвращаем
-			if res.done {
-				return res.result, 0, "", true
-			}
-
-			// Если ошибка - продолжаем, но логируем
-			if res.err != "" && a.progress != nil {
-				a.progress.DoneStep(true)
-			} else if a.progress != nil {
-				a.progress.DoneStep(false)
-			}
-
-			// Отправляем результат в Telegram
-			if !res.done && res.prNum == 0 && res.err == "" {
-				task.Steps <- Step{Type: StepResult, Content: truncateS(res.result, 500)}
-			}
-		}
-	}
-
-	// Собираем все результаты для LLM
-	var allResults strings.Builder
-	for i := range dag.Nodes {
-		if result := dag.GetResult(i); result != "" {
-			allResults.WriteString(fmt.Sprintf("[%s]: %s\n", dag.Nodes[i].Action.Tool, truncateS(result, 200)))
-		}
-	}
-
-	return allResults.String(), 0, "", false
-}
-
-func (a *Agent) execute(act action, branch string, task *Task) (result string, prNum int, prURL string, done bool, errMsg string) {
-	// Сообщаем трекеру о старте шага
-	arg := shortArgs(act.Args)
-	if a.progress != nil {
-		a.progress.StartStep(act.Tool, arg)
-	}
-	task.Steps <- Step{Type: StepAction, Content: fmt.Sprintf("%s(%s)", act.Tool, truncateS(arg, 40))}
-
+func (a *Agent) execute(act action, branch string) (result string, prNum int, prURL string, done bool, errMsg string) {
 	switch act.Tool {
 	case "read_file":
 		content, err := a.gh.GetContent(act.Args["path"], "main")
@@ -473,7 +165,12 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 		return content, 0, "", false, ""
 
 	case "write_file":
-		err := a.gh.WriteFile(branch, act.Args["path"], act.Args["content"], act.Args["message"])
+		content := act.Args["content"]
+		message := act.Args["message"]
+		if message == "" {
+			message = "update " + act.Args["path"]
+		}
+		err := a.gh.WriteFile(branch, act.Args["path"], content, message)
 		if err != nil {
 			return "", 0, "", false, err.Error()
 		}
@@ -493,180 +190,19 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 		}
 		return results, 0, "", false, ""
 
-	case "search_history":
-		if a.bot == nil || a.bot.history == nil {
-			return "", 0, "", false, "История сообщений недоступна"
-		}
-		query := act.Args["query"]
-		threadIDStr := act.Args["thread_id"]
-		limit := 10
-
-		var results []HistoryMessage
-		if threadIDStr != "" {
-			threadID, _ := strconv.Atoi(threadIDStr)
-			results = a.bot.history.SearchInThread(threadID, query, limit)
-		} else {
-			results = a.bot.history.Search(query, limit)
-		}
-
-		return FormatSearchResults(results), 0, "", false, ""
-
-	case "get_summary":
-		if a.bot == nil || a.bot.history == nil {
-			return "", 0, "", false, "История сообщений недоступна"
-		}
-		threadIDStr := act.Args["thread_id"]
-		count := 20
-		if countStr := act.Args["count"]; countStr != "" {
-			if c, err := strconv.Atoi(countStr); err == nil && c > 0 {
-				count = c
-			}
-		}
-
-		var summary string
-		if threadIDStr != "" {
-			threadID, _ := strconv.Atoi(threadIDStr)
-			summary = a.bot.history.GetThreadSummary(threadID, count)
-		} else {
-			// Саммари всех последних сообщений
-			recent := a.bot.history.GetRecentMessages(count)
-			summary = FormatSearchResults(recent)
-		}
-
-		return summary, 0, "", false, ""
-
-	case "spawn_subagent":
-		subTask := &Task{
-			ID: task.ID + "-sub", Description: act.Args["task"],
-			Owner: a.owner, Repo: a.repo, Branch: branch,
-			Steps:     make(chan Step, 50),
-			StartedAt: time.Now(),
-		}
-		sub := NewAgent(a.cfg, a.owner, a.repo).WithBot(a.bot, a.threadID)
-		if a.bot != nil {
-			subPT := NewProgressTracker(a.bot, act.Args["task"], a.owner, a.repo, a.threadID)
-			sub = sub.WithProgress(subPT)
-		}
-		go sub.Run(subTask)
-		var sb strings.Builder
-		for step := range subTask.Steps {
-			task.Steps <- step
-			if step.Type == StepDone {
-				sb.WriteString(step.Content)
-			}
-		}
-		return "subagent: " + sb.String(), 0, "", false, ""
-
-	case "orchestrate":
-		taskLines := strings.Split(strings.TrimSpace(act.Args["tasks"]), "\n")
-		type orchResult struct {
-			idx    int
-			output string
-			errMsg string
-		}
-		results := make(chan orchResult, len(taskLines))
-		count := 0
-		for i, t := range taskLines {
-			t = strings.TrimSpace(t)
-			if t == "" {
-				continue
-			}
-			count++
-			go func(idx int, taskDesc string) {
-				subTask := &Task{
-					ID:          fmt.Sprintf("%s-orch-%d", task.ID, idx),
-					Description: taskDesc,
-					Owner:       a.owner, Repo: a.repo, Branch: branch,
-					Steps:     make(chan Step, 50),
-					StartedAt: time.Now(),
-				}
-				sub := NewAgent(a.cfg, a.owner, a.repo).WithBot(a.bot, a.threadID)
-				if a.bot != nil {
-					subPT := NewProgressTracker(a.bot, taskDesc, a.owner, a.repo, a.threadID)
-					sub = sub.WithProgress(subPT)
-				}
-				go sub.Run(subTask)
-				var sb strings.Builder
-				for step := range subTask.Steps {
-					task.Steps <- step
-					if step.Type == StepDone {
-						sb.WriteString(step.Content)
-					} else if step.Type == StepError {
-						results <- orchResult{idx: idx, errMsg: step.Content}
-						return
-					}
-				}
-				results <- orchResult{idx: idx, output: sb.String()}
-			}(i, t)
-		}
-		var parts []string
-		for i := 0; i < count; i++ {
-			r := <-results
-			if r.errMsg != "" {
-				parts = append(parts, fmt.Sprintf("agent %d error: %s", r.idx, r.errMsg))
-			} else {
-				parts = append(parts, fmt.Sprintf("agent %d: %s", r.idx, r.output))
-			}
-		}
-		return strings.Join(parts, "\n"), 0, "", false, ""
-
-	case "get_user_repos":
-		username := act.Args["username"]
-		if username == "" {
-			username = a.owner
-		}
-		repos, err := a.gh.GetUserRepos(username)
-		if err != nil {
-			return "", 0, "", false, err.Error()
-		}
-		return repos, 0, "", false, ""
-
-	case "set_avatar":
-		if a.bot == nil {
-			return "", 0, "", false, "Бот недоступен"
-		}
-		// Проверяем наличие OpenAI ключа, запрашиваем если нужно
-		if a.bot.apiKeys != nil && !a.bot.apiKeys.HasKey("openai") {
-			key, err := a.bot.apiKeys.RequestKey("openai", a.threadID)
-			if err != nil {
-				return "", 0, "", false, "API key required: " + err.Error()
-			}
-			// Обновляем конфиг
-			a.bot.cfg.OpenAIKey = key
-		}
-		if err := a.bot.setBotAvatar(); err != nil {
-			return "", 0, "", false, err.Error()
-		}
-		return "Аватарка обновлена успешно", 0, "", false, ""
-
-	case "manage_topics":
-		if a.bot == nil {
-			return "", 0, "", false, "Бот недоступен"
-		}
-		action := act.Args["action"] // "create" или "delete"
-		topicName := act.Args["name"]
-
-		if action == "delete" {
-			if err := a.bot.topics.DeleteTopic(topicName); err != nil {
-				return "", 0, "", false, err.Error()
-			}
-			return fmt.Sprintf("Топик '%s' удален", topicName), 0, "", false, ""
-		} else if action == "create" {
-			owner := act.Args["owner"]
-			repo := act.Args["repo"]
-			threadID := a.bot.topics.GetOrCreate(owner, repo)
-			return fmt.Sprintf("Топик '%s/%s' создан (ID: %d)", owner, repo, threadID), 0, "", false, ""
-		}
-		return "", 0, "", false, "Неизвестное действие: " + action
-
 	case "create_pr":
+		title := act.Args["title"]
+		body := act.Args["body"]
+
+		// Запрашиваем подтверждение через бота
 		if a.bot != nil {
-			msg := fmt.Sprintf("🔀 Создать PR?\n*%s*", act.Args["title"])
-			if !a.bot.requestApproval(task.ID, msg, a.threadID) {
+			msg := fmt.Sprintf("🔀 Создать PR?\n*%s*", title)
+			if !a.bot.requestApproval(fmt.Sprintf("pr-%d", time.Now().Unix()), msg, a.threadID) {
 				return "PR создание отменено пользователем", 0, "", false, ""
 			}
 		}
-		num, url, err := a.gh.CreatePR(branch, act.Args["title"], act.Args["body"])
+
+		num, url, err := a.gh.CreatePR(branch, title, body)
 		if err != nil {
 			return "", 0, "", false, err.Error()
 		}
@@ -679,9 +215,11 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 	return "", 0, "", false, "unknown tool: " + act.Tool
 }
 
-func (a *Agent) buildContext(task string) string {
+func (a *Agent) buildContext() string {
 	var parts []string
-	for _, f := range []string{"CLAUDE.md", "AGENT.md", "README.md"} {
+
+	// Ищем документацию
+	for _, f := range []string{"README.md", "CLAUDE.md", "AGENT.md"} {
 		if c, err := a.gh.GetContent(f, "main"); err == nil {
 			if len(c) > 3000 {
 				c = c[:3000] + "..."
@@ -690,13 +228,17 @@ func (a *Agent) buildContext(task string) string {
 			break
 		}
 	}
-	for _, dir := range []string{"src", ".", "lib", "app"} {
+
+	// Листинг директории
+	for _, dir := range []string{".", "src", "lib", "app"} {
 		if files, err := a.gh.ListDir(dir, "main"); err == nil && len(files) > 0 {
 			parts = append(parts, fmt.Sprintf("## %s/\n%s", dir, strings.Join(files, "\n")))
 			break
 		}
 	}
-	for _, f := range []string{"package.json", "go.mod", "pyproject.toml"} {
+
+	// Манифест
+	for _, f := range []string{"package.json", "go.mod", "pyproject.toml", "Cargo.toml"} {
 		if c, err := a.gh.GetContent(f, "main"); err == nil {
 			if len(c) > 800 {
 				c = c[:800]
@@ -705,144 +247,16 @@ func (a *Agent) buildContext(task string) string {
 			break
 		}
 	}
-	_ = task
+
 	return strings.Join(parts, "\n\n")
 }
 
-// ── LLM ──────────────────────────────────────────────────────
+// ── Parsing ───────────────────────────────────────────────────
 
 type msg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string
+	Content string
 }
-
-func (a *Agent) llm(messages []msg) (string, error) {
-	if a.cfg.LLMProvider == "claude" {
-		return callClaude(a.cfg.AnthropicKey, messages)
-	}
-	return callDeepSeek(a.cfg.DeepSeekKey, messages)
-}
-
-func callDeepSeek(key string, messages []msg) (string, error) {
-	if key == "" {
-		return "", fmt.Errorf("❌ DEEPSEEK_API_KEY не найден\n\n👉 Добавь в Railway Variables или .env:\nDEEPSEEK_API_KEY=sk-...\n\nПолучить ключ: platform.deepseek.com")
-	}
-	body, _ := json.Marshal(map[string]any{
-		"model": "deepseek-chat", "max_tokens": 8192, "temperature": 0.1,
-		"messages": messages,
-	})
-	req, _ := http.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	return parseOpenAI(resp.Body)
-}
-
-func callClaude(key string, messages []msg) (string, error) {
-	if key == "" {
-		return "", fmt.Errorf("❌ ANTHROPIC_API_KEY не найден\n\n👉 Добавь в Railway Variables или .env:\nANTHROPIC_API_KEY=sk-ant-...\n\nПолучить ключ: console.anthropic.com")
-	}
-	var system string
-	var rest []msg
-	for _, m := range messages {
-		if m.Role == "system" {
-			system = m.Content
-		} else {
-			rest = append(rest, m)
-		}
-	}
-	// system как массив с cache_control — кэширует большой system prompt между шагами ReAct цикла
-	systemBlocks := []map[string]any{
-		{"type": "text", "text": system, "cache_control": map[string]string{"type": "ephemeral"}},
-	}
-	body, _ := json.Marshal(map[string]any{
-		"model": "claude-opus-4-5-20251101", "max_tokens": 16384,
-		"system": systemBlocks, "messages": rest,
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	return parseAnthropic(resp.Body)
-}
-
-func parseOpenAI(r io.Reader) (string, error) {
-	var result struct {
-		Choices []struct {
-			Message struct{ Content string } `json:"message"`
-		} `json:"choices"`
-		Error *struct{ Message string } `json:"error"`
-	}
-	if err := json.NewDecoder(r).Decode(&result); err != nil {
-		return "", err
-	}
-	if result.Error != nil {
-		return "", fmt.Errorf("API: %s", result.Error.Message)
-	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("empty")
-	}
-	return result.Choices[0].Message.Content, nil
-}
-
-// lastUsage - глобальная переменная для хранения последнего usage (временное решение)
-var lastUsage struct {
-	Input      int
-	Output     int
-	CacheRead  int
-	CacheWrite int
-}
-
-func parseAnthropic(r io.Reader) (string, error) {
-	var result struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		Usage *struct {
-			InputTokens          int `json:"input_tokens"`
-			OutputTokens         int `json:"output_tokens"`
-			CacheCreationTokens  int `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens int `json:"cache_read_input_tokens"`
-		} `json:"usage"`
-		Error *struct{ Message string } `json:"error"`
-	}
-	if err := json.NewDecoder(r).Decode(&result); err != nil {
-		return "", err
-	}
-	if result.Error != nil {
-		return "", fmt.Errorf("API: %s", result.Error.Message)
-	}
-
-	// Сохраняем usage для передачи в progress tracker
-	if result.Usage != nil {
-		lastUsage.Input = result.Usage.InputTokens
-		lastUsage.Output = result.Usage.OutputTokens
-		lastUsage.CacheRead = result.Usage.CacheReadInputTokens
-		lastUsage.CacheWrite = result.Usage.CacheCreationTokens
-	}
-
-	for _, c := range result.Content {
-		if c.Type == "text" {
-			return c.Text, nil
-		}
-	}
-	return "", fmt.Errorf("no text")
-}
-
-// ── Parsing ───────────────────────────────────────────────────
 
 type action struct {
 	Tool string
@@ -897,19 +311,12 @@ func makeBranch(desc, id string) string {
 }
 
 func shortArgs(args map[string]string) string {
-	for _, k := range []string{"path", "title", "task", "query"} {
+	for _, k := range []string{"path", "title", "query"} {
 		if v := args[k]; v != "" {
-			return truncateS(v, 40)
+			return truncate(v, 40)
 		}
 	}
 	return ""
-}
-
-func truncateS(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
 }
 
 func systemPrompt(owner, repo, ctx string) string {
@@ -943,53 +350,9 @@ query: "useUserData"
 </action>
 
 <action>
-tool: "search_history"
-query: "bug fix"
-thread_id: "123"
-</action>
-
-<action>
-tool: "get_summary"
-thread_id: "123"
-count: "20"
-</action>
-
-<action>
-tool: "spawn_subagent"
-task: "Write Playwright test for TrackingScreen"
-</action>
-
-<action>
-tool: "orchestrate"
-tasks: "Write unit tests for AuthService\nWrite integration test for login flow\nUpdate API docs"
-</action>
-
-<action>
-tool: "get_user_repos"
-username: "Gammanik"
-</action>
-
-<action>
-tool: "set_avatar"
-</action>
-
-<action>
-tool: "manage_topics"
-action: "create"
-owner: "Gammanik"
-repo: "peerpack-bot"
-</action>
-
-<action>
-tool: "manage_topics"
-action: "delete"
-name: "owner/old-repo"
-</action>
-
-<action>
 tool: "create_pr"
 title: "feat: add tracking screen"
-body: "## Changes\n- TrackingScreen.jsx\n- useTracking.ts\n- e2e test"
+body: "## Changes\n- TrackingScreen.jsx\n- useTracking.ts"
 </action>
 
 <action>
@@ -998,126 +361,24 @@ summary: "Analysis complete"
 </action>
 
 ## Rules
-1. Read files before writing — check existing patterns
-2. Every new component → Playwright test in tests/e2e/
-3. Every Supabase hook → integration test in tests/integration/
-4. Follow existing code style
-5. After all files written → create_pr
-6. Write Thought: before each action
+1. Read files before writing - understand existing patterns
+2. Follow existing code style
+3. After all files written → create_pr
+4. Write "Thought:" before each action to explain your reasoning
+5. Keep changes focused - don't over-engineer
 
-## When to use tools
-- "мои репо" / "my repos" → use get_user_repos
-- "поменяй аватарку" / "change avatar" → use set_avatar
-- "создай топик" / "create topic" → use manage_topics (action: create)
-- "удали топик" / "delete topic" → use manage_topics (action: delete)
-- Questions about code → use read_file, search_code
-- Search conversations → use search_history, get_summary
-
-## Parallel execution
-Actions that don't depend on each other will run in parallel automatically.
 Example:
-  read_file(A), read_file(B), read_file(C) → all 3 run simultaneously
-  read_file(A) then write_file(A, ...) → sequential (dependency)
-
-Always provide time estimates for planning.`, owner, repo, ctx)
-}
-
-func systemPromptWithPlan(owner, repo string, plan *TaskPlan) string {
-	return fmt.Sprintf(`You are an AI coding agent for %s/%s.
-
-## Execution Plan (follow this):
-%s
-
-Your task is to execute this plan step by step. Use the tools below.
-If you encounter errors, report them immediately.
-
-## Available Tools
-
+Thought: I need to understand the current auth implementation
 <action>
 tool: "read_file"
-path: "src/components/Example.jsx"
+path: "src/auth/AuthService.ts"
 </action>
 
+Thought: Now I'll add the new logout feature
 <action>
 tool: "write_file"
-path: "src/components/New.jsx"
-content: "import React from 'react';\nexport default function New() { return <div/>; }"
-message: "feat: add New component"
-</action>
-
-<action>
-tool: "list_files"
-path: "src"
-</action>
-
-<action>
-tool: "search_code"
-query: "useUserData"
-</action>
-
-<action>
-tool: "search_history"
-query: "bug fix"
-thread_id: "123"
-</action>
-
-<action>
-tool: "get_summary"
-thread_id: "123"
-count: "20"
-</action>
-
-<action>
-tool: "spawn_subagent"
-task: "Write Playwright test for TrackingScreen"
-</action>
-
-<action>
-tool: "orchestrate"
-tasks: "Write unit tests for AuthService\nWrite integration test for login flow\nUpdate API docs"
-</action>
-
-<action>
-tool: "get_user_repos"
-username: "Gammanik"
-</action>
-
-<action>
-tool: "set_avatar"
-</action>
-
-<action>
-tool: "manage_topics"
-action: "create"
-owner: "Gammanik"
-repo: "peerpack-bot"
-</action>
-
-<action>
-tool: "manage_topics"
-action: "delete"
-name: "owner/old-repo"
-</action>
-
-<action>
-tool: "create_pr"
-title: "feat: add tracking screen"
-body: "## Changes\n- TrackingScreen.jsx\n- useTracking.ts\n- e2e test"
-</action>
-
-<action>
-tool: "done"
-summary: "Analysis complete"
-</action>
-
-## Execution Rules
-1. Follow the plan phases in order
-2. Report any deviations or errors immediately
-3. Write Thought: before each action to explain your progress
-4. Use the exact tools specified in the plan
-5. After completing all phases → create_pr or done
-
-## Important
-The plan is a guide. If you discover issues during execution, report them.
-The system will replan automatically if needed.`, owner, repo, plan.Format())
+path: "src/auth/AuthService.ts"
+content: "..."
+message: "feat: add logout functionality"
+</action>`, owner, repo, ctx)
 }
