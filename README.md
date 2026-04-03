@@ -85,6 +85,8 @@ Voice messages work too! 🎤
 - `/status` - Show bot status
 - `/help` - Show help
 
+**💡 Auto-detection**: Just mention any repository in `owner/repo` format — the bot will automatically switch to it!
+
 ## Architecture
 
 ```
@@ -142,9 +144,9 @@ User: добавь кнопку logout в хедер
 
 ### PR Management
 ```
-User: покажи мои PR
+User: покажи PR для gammanik/myapp
 
-📋 Открытые PR для Gammanik/PeerPack:
+📋 Открытые PR для gammanik/myapp:
 
 1. #42 - Add logout button
    ✅ Merge #42  ❌ Close #42

@@ -169,6 +169,14 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message, threadID int) {
 }
 
 func (b *Bot) route(text string, threadID int) {
+	// Пытаемся извлечь owner/repo из текста (например: "покажи PR для gammanik/app")
+	if owner, repo, found := extractRepo(text); found {
+		b.repoMu.Lock()
+		b.owner, b.repo = owner, repo
+		b.repoMu.Unlock()
+		log.Printf("📍 Переключено на репозиторий: %s/%s", owner, repo)
+	}
+
 	o, r := b.currentRepo()
 
 	// Используем Haiku для быстрой классификации
@@ -245,7 +253,17 @@ func (b *Bot) sendVoice(text string, threadID int) {
 
 func (b *Bot) chat(text string, threadID int) {
 	o, r := b.currentRepo()
-	system := fmt.Sprintf(`Ты AI-ассистент разработчика. Репо: %s/%s. Отвечай кратко на русском.`, o, r)
+	system := fmt.Sprintf(`Ты AI-ассистент для разработчиков, работающий с GitHub репозиториями.
+
+Текущий репозиторий: %s/%s
+
+Твои возможности:
+- Анализ кода и архитектуры проекта
+- Помощь в отладке и рефакторинге
+- Объяснение функциональности
+- Рекомендации по улучшению кода
+
+Отвечай кратко на русском.`, o, r)
 
 	phID := b.tg("💭", threadID)
 
@@ -570,16 +588,21 @@ func (b *Bot) sendStatus(threadID int) {
 
 func (b *Bot) helpText() string {
 	o, r := b.currentRepo()
-	return fmt.Sprintf(`🤖 *claude-tg*
-Репо: `+"`%s/%s`"+`
+	return fmt.Sprintf(`🤖 *claude-tg* — AI-ассистент для GitHub
+
+Текущий репозиторий: `+"`%s/%s`"+`
 
 Просто пиши или говори:
 — задачу → агент создаст PR
 — вопрос → чат с AI
-— "покажи PR" → список PR
+— "покажи PR для owner/repo" → список PR любого репо
 
 *Команды:*
-`+"`/repo owner/name`"+` | `+"`/prs`"+` | `+"`/status`", o, r)
+`+"`/repo owner/name`"+` — переключить репозиторий
+`+"`/prs`"+` — показать PR
+`+"`/status`"+` — текущий статус
+
+💡 *Автоопределение:* упомяни любой репозиторий в формате `+"`owner/repo`"+` — бот автоматически переключится на него`, o, r)
 }
 
 func (b *Bot) currentRepo() (string, string) {
@@ -647,6 +670,42 @@ func (b *Bot) sendWithButtons(text string, keyboard [][]map[string]any, threadID
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+// extractRepo извлекает owner/repo из текста (например: "покажи PR для gammanik/app")
+// Возвращает owner, repo, found
+func extractRepo(text string) (string, string, bool) {
+	// Ищем паттерн owner/repo (латиница, цифры, дефис, подчеркивание)
+	// Примеры: gammanik/peerpack, Gammanik/PeerPack, user123/my-repo_v2
+	for i := 0; i < len(text)-2; i++ {
+		if text[i] == '/' {
+			// Ищем владельца слева от /
+			ownerStart := i - 1
+			for ownerStart >= 0 && isRepoChar(text[ownerStart]) {
+				ownerStart--
+			}
+			ownerStart++
+
+			// Ищем название репо справа от /
+			repoEnd := i + 1
+			for repoEnd < len(text) && isRepoChar(text[repoEnd]) {
+				repoEnd++
+			}
+
+			if ownerStart < i && repoEnd > i+1 {
+				owner := text[ownerStart:i]
+				repo := text[i+1 : repoEnd]
+				if len(owner) > 0 && len(repo) > 0 {
+					return owner, repo, true
+				}
+			}
+		}
+	}
+	return "", "", false
+}
+
+func isRepoChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+}
 
 func truncate(s string, max int) string {
 	if len(s) <= max {
