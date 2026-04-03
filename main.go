@@ -3,9 +3,14 @@ package main
 import (
 	"log"
 	"os"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Загружаем .env файл (игнорируем ошибки - переменные могут быть в окружении)
+	godotenv.Load()
+
 	cfg := Config{
 		TelegramToken: mustEnv("TELEGRAM_BOT_TOKEN"),
 		AllowedChatID: mustEnv("TELEGRAM_CHAT_ID"),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -72,7 +73,16 @@ func (b *Bot) editRaw(msgID int, text string) {
 	}
 	body, _ := json.Marshal(payload)
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", b.cfg.TelegramToken)
-	http.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("editRaw: msgID=%d err=%v", msgID, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("editRaw: msgID=%d status=%d body=%s", msgID, resp.StatusCode, string(body))
+	}
 }
 
 // sendMessageRaw — возвращает message_id для последующего редактирования

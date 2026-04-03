@@ -240,6 +240,8 @@ func looksLikeReminder(lower string) bool {
 
 func (b *Bot) chat(text string, threadID int) {
 	phID := b.tg("🤔 _анализирую вопрос..._", threadID)
+	log.Printf("chat: msgID=%d threadID=%d text=%q", phID, threadID, text)
+
 	o, r := b.currentRepo()
 	system := fmt.Sprintf(
 		`Ты AI-ассистент разработчика Никиты. Репо: %s/%s. Отвечай кратко на русском.`, o, r)
@@ -248,12 +250,15 @@ func (b *Bot) chat(text string, threadID int) {
 		b.edit(phID, partial+" ▌")
 	})
 	if err != nil {
-		b.edit(phID, "❌ "+err.Error())
+		errMsg := "❌ " + err.Error()
+		log.Printf("chat: error streaming - %v", err)
+		b.edit(phID, errMsg)
 		return
 	}
 	if full == "" {
 		full = "_(нет ответа)_"
 	}
+	log.Printf("chat: done, full length=%d", len(full))
 	b.edit(phID, full)
 }
 
