@@ -272,6 +272,12 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 		return strings.Join(parts, "\n"), 0, "", false, ""
 
 	case "create_pr":
+		if a.bot != nil {
+			msg := fmt.Sprintf("🔀 Создать PR?\n*%s*", act.Args["title"])
+			if !a.bot.requestApproval(task.ID, msg, a.threadID) {
+				return "PR создание отменено пользователем", 0, "", false, ""
+			}
+		}
 		num, url, err := a.gh.CreatePR(branch, act.Args["title"], act.Args["body"])
 		if err != nil {
 			return "", 0, "", false, err.Error()

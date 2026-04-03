@@ -39,6 +39,28 @@ func (b *Bot) sendRaw(text string, threadID int) {
 	json.NewDecoder(resp.Body).Decode(&result)
 }
 
+// sendWithButtons — отправляет сообщение с inline-кнопками через raw API
+func (b *Bot) sendWithButtons(text string, keyboard [][]map[string]any, threadID int) {
+	payload := map[string]any{
+		"chat_id":                  strconv.FormatInt(b.chatID, 10),
+		"text":                     text,
+		"parse_mode":               "Markdown",
+		"disable_web_page_preview": true,
+		"reply_markup":             map[string]any{"inline_keyboard": keyboard},
+	}
+	if threadID != 0 {
+		payload["message_thread_id"] = threadID
+	}
+	body, _ := json.Marshal(payload)
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", b.cfg.TelegramToken)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("sendWithButtons: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
 // editRaw — редактирует сообщение через raw API
 func (b *Bot) editRaw(msgID int, text string) {
 	payload := map[string]any{
