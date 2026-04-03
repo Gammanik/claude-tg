@@ -197,16 +197,33 @@ func (b *Bot) route(text string, threadID int) {
 }
 
 func looksLikeTask(lower string) bool {
-	for _, kw := range []string{
+	taskKeywords := []string{
 		"добавь", "сделай", "создай", "напиши", "исправь", "fix", "add", "create",
 		"рефактори", "refactor", "удали", "реализуй", "implement", "перепиши",
 		"rewrite", "обнови", "update", "измени", "поменяй", "смени", "deploy",
 		"покрой тестами",
-	} {
+	}
+
+	// Ключевые слова для запросов, требующих тулы
+	toolKeywords := []string{
+		"мои репо", "my repos", "активные проект", "active project",
+		"топик", "topic", "аватарк", "avatar",
+		"список репо", "list repos", "github репо",
+		"по каким проект", "what projects", "работа идет",
+	}
+
+	for _, kw := range taskKeywords {
 		if strings.Contains(lower, kw) {
 			return true
 		}
 	}
+
+	for _, kw := range toolKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+
 	return false
 }
 

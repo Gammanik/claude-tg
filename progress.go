@@ -175,6 +175,17 @@ func (pt *ProgressTracker) render() string {
 		}
 	}
 
+	// Параллельное выполнение (если было)
+	parallelCount := 0
+	for _, step := range pt.done {
+		if strings.Contains(step.label, "||") {
+			parallelCount++
+		}
+	}
+	if parallelCount > 0 {
+		sb.WriteString(fmt.Sprintf("\n⚡ %d тулов выполнено параллельно", parallelCount))
+	}
+
 	if pt.done_ {
 		sb.WriteString(fmt.Sprintf("\n\n✅ *Готово за %s*", fmtDuration(elapsed)))
 	}

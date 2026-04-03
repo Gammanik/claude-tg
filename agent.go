@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -149,38 +150,26 @@ func (a *Agent) Run(task *Task) {
 			return
 		}
 
-		for _, act := range actions {
-			result, prNum, prURL, done, errMsg := a.execute(act, branch, task)
-			if errMsg != "" {
-				result = "error: " + errMsg
-				if a.progress != nil {
-					a.progress.DoneStep(true)
-				}
-			} else if a.progress != nil {
-				a.progress.DoneStep(false)
-			}
+		// Выполняем actions параллельно с учетом зависимостей
+		results, prNum, prURL, done := a.executeActionsParallel(actions, branch, task)
 
-			// Отправляем результат выполнения тула в Telegram
-			if !done && prNum == 0 && errMsg == "" {
-				task.Steps <- Step{Type: StepResult, Content: truncateS(result, 500)}
+		if prNum > 0 {
+			task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
+			if a.progress != nil {
+				a.progress.SetPR(prNum, prURL)
 			}
-
-			if prNum > 0 {
-				task.Steps <- Step{Type: StepPR, PRNumber: prNum, PRURL: prURL}
-				if a.progress != nil {
-					a.progress.SetPR(prNum, prURL)
-				}
-				return
-			}
-			if done {
-				task.Steps <- Step{Type: StepDone, Content: result}
-				if a.progress != nil {
-					a.progress.Finish()
-				}
-				return
-			}
-			messages = append(messages, msg{Role: "user", Content: "Tool result:\n" + result})
+			return
 		}
+		if done {
+			task.Steps <- Step{Type: StepDone, Content: results}
+			if a.progress != nil {
+				a.progress.Finish()
+			}
+			return
+		}
+
+		// Собираем результаты для передачи в LLM
+		messages = append(messages, msg{Role: "user", Content: "Tool results:\n" + results})
 	}
 	task.Steps <- Step{Type: StepError, Content: "Превышен лимит шагов"}
 }
@@ -191,6 +180,104 @@ func (a *Agent) think(content string, task *Task) {
 
 func (a *Agent) act(label string, task *Task) {
 	task.Steps <- Step{Type: StepAction, Content: label}
+}
+
+// executeActionsParallel - выполняет actions параллельно с учетом зависимостей
+func (a *Agent) executeActionsParallel(actions []action, branch string, task *Task) (results string, prNum int, prURL string, done bool) {
+	if len(actions) == 0 {
+		return "", 0, "", false
+	}
+
+	// Строим DAG
+	dag := NewActionDAG(actions)
+
+	// Логируем DAG для дебага
+	if a.bot != nil {
+		dagInfo := dag.PrintDAG()
+		task.Steps <- Step{Type: StepThought, Content: "Execution plan:\n" + dagInfo}
+	}
+
+	// Параллельное выполнение
+	type execResult struct {
+		nodeID int
+		result string
+		prNum  int
+		prURL  string
+		done   bool
+		err    string
+	}
+
+	resultChan := make(chan execResult, len(actions))
+	var wg sync.WaitGroup
+
+	// Выполняем actions волнами (по уровням зависимостей)
+	for !dag.AllCompleted() {
+		executable := dag.GetExecutableNodes()
+		if len(executable) == 0 {
+			break // deadlock или ошибка
+		}
+
+		// Запускаем все executable nodes параллельно
+		for _, nodeID := range executable {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+
+				node := &dag.Nodes[id]
+				result, pNum, pURL, isDone, errMsg := a.execute(node.Action, branch, task)
+
+				resultChan <- execResult{
+					nodeID: id,
+					result: result,
+					prNum:  pNum,
+					prURL:  pURL,
+					done:   isDone,
+					err:    errMsg,
+				}
+			}(nodeID)
+		}
+
+		// Ждем завершения этой волны
+		wg.Wait()
+
+		// Собираем результаты
+		for i := 0; i < len(executable); i++ {
+			res := <-resultChan
+			dag.MarkCompleted(res.nodeID, res.result, res.err)
+
+			// Если создали PR - возвращаем сразу
+			if res.prNum > 0 {
+				return res.result, res.prNum, res.prURL, false
+			}
+
+			// Если done - возвращаем
+			if res.done {
+				return res.result, 0, "", true
+			}
+
+			// Если ошибка - продолжаем, но логируем
+			if res.err != "" && a.progress != nil {
+				a.progress.DoneStep(true)
+			} else if a.progress != nil {
+				a.progress.DoneStep(false)
+			}
+
+			// Отправляем результат в Telegram
+			if !res.done && res.prNum == 0 && res.err == "" {
+				task.Steps <- Step{Type: StepResult, Content: truncateS(res.result, 500)}
+			}
+		}
+	}
+
+	// Собираем все результаты для LLM
+	var allResults strings.Builder
+	for i := range dag.Nodes {
+		if result := dag.GetResult(i); result != "" {
+			allResults.WriteString(fmt.Sprintf("[%s]: %s\n", dag.Nodes[i].Action.Tool, truncateS(result, 200)))
+		}
+	}
+
+	return allResults.String(), 0, "", false
 }
 
 func (a *Agent) execute(act action, branch string, task *Task) (result string, prNum int, prURL string, done bool, errMsg string) {
@@ -734,5 +821,21 @@ summary: "Analysis complete"
 3. Every Supabase hook → integration test in tests/integration/
 4. Follow existing code style
 5. After all files written → create_pr
-6. Write Thought: before each action`, owner, repo, ctx)
+6. Write Thought: before each action
+
+## When to use tools
+- "мои репо" / "my repos" → use get_user_repos
+- "поменяй аватарку" / "change avatar" → use set_avatar
+- "создай топик" / "create topic" → use manage_topics (action: create)
+- "удали топик" / "delete topic" → use manage_topics (action: delete)
+- Questions about code → use read_file, search_code
+- Search conversations → use search_history, get_summary
+
+## Parallel execution
+Actions that don't depend on each other will run in parallel automatically.
+Example:
+  read_file(A), read_file(B), read_file(C) → all 3 run simultaneously
+  read_file(A) then write_file(A, ...) → sequential (dependency)
+
+Always provide time estimates for planning.`, owner, repo, ctx)
 }
