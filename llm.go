@@ -86,13 +86,13 @@ func (c *LLMClient) callAnthropic(tier ModelTier, system, user string, stream bo
 func (c *LLMClient) selectAnthropicModel(tier ModelTier) string {
 	switch tier {
 	case TierHaiku:
-		return "claude-haiku-4-5-20251001"
+		return "claude-3-5-haiku-20241022"
 	case TierSonnet:
-		return "claude-sonnet-4-5-20241022"
+		return "claude-3-5-sonnet-20241022"
 	case TierOpus:
-		return "claude-opus-4-5-20251101"
+		return "claude-3-opus-20240229"
 	default:
-		return "claude-sonnet-4-5-20241022"
+		return "claude-3-5-sonnet-20241022"
 	}
 }
 
