@@ -17,7 +17,7 @@ func main() {
 		GitHubToken:   mustEnv("GITHUB_TOKEN"),
 		DefaultOwner:  getEnv("GITHUB_DEFAULT_OWNER", "Gammanik"),
 		DefaultRepo:   getEnv("GITHUB_DEFAULT_REPO", "PeerPack"),
-		DirectCommit:  getEnv("DIRECT_COMMIT", "false") == "true",
+		DirectCommit:  getEnv("DIRECT_COMMIT", "true") == "true",
 		LLMProvider:   getEnv("LLM_PROVIDER", "anthropic"),
 		AnthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		DeepSeekKey:   os.Getenv("DEEPSEEK_API_KEY"),
@@ -25,7 +25,7 @@ func main() {
 		GroqKey:       os.Getenv("GROQ_API_KEY"),
 	}
 
-	log.Printf("🤖 claude-tg starting (provider=%s)", cfg.LLMProvider)
+	log.Printf("🤖 claude-tg starting (provider=%s, direct_commit=%v)", cfg.LLMProvider, cfg.DirectCommit)
 
 	bot := NewBot(cfg)
 	if err := bot.Start(); err != nil {

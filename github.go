@@ -89,7 +89,7 @@ func (c *GitHubClient) GetContent(path, branch string) (string, error) {
 	return string(decoded), nil
 }
 
-func (c *GitHubClient) WriteFile(branch, path, content, message string) error {
+func (c *GitHubClient) WriteFile(branch, path, content, message string) (commitSHA string, err error) {
 	// SHA существующего файла (нужен для update)
 	var existing struct {
 		SHA string `json:"sha"`
@@ -104,7 +104,16 @@ func (c *GitHubClient) WriteFile(branch, path, content, message string) error {
 	if existing.SHA != "" {
 		body["sha"] = existing.SHA
 	}
-	return c.put(fmt.Sprintf("/contents/%s", path), body, nil)
+
+	var result struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	if err := c.put(fmt.Sprintf("/contents/%s", path), body, &result); err != nil {
+		return "", err
+	}
+	return result.Commit.SHA, nil
 }
 
 func (c *GitHubClient) ListDir(dir, branch string) ([]string, error) {

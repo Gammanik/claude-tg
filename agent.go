@@ -31,6 +31,7 @@ type Task struct {
 	Description string
 	Owner, Repo string
 	Branch      string
+	Commits     []string // SHA коммитов
 	Steps       chan Step
 	StartedAt   time.Time
 }
@@ -147,7 +148,7 @@ func (a *Agent) executeActions(actions []action, branch string, task *Task) (res
 	for _, act := range actions {
 		task.Steps <- Step{Type: StepAction, Content: fmt.Sprintf("%s(%s)", act.Tool, shortArgs(act.Args))}
 
-		result, pNum, pURL, isDone, errMsg := a.execute(act, branch)
+		result, pNum, pURL, isDone, errMsg := a.execute(act, branch, task)
 
 		if pNum > 0 {
 			return result, pNum, pURL, false
@@ -167,7 +168,7 @@ func (a *Agent) executeActions(actions []action, branch string, task *Task) (res
 	return sb.String(), 0, "", false
 }
 
-func (a *Agent) execute(act action, branch string) (result string, prNum int, prURL string, done bool, errMsg string) {
+func (a *Agent) execute(act action, branch string, task *Task) (result string, prNum int, prURL string, done bool, errMsg string) {
 	switch act.Tool {
 	case "read_file":
 		content, err := a.gh.GetContent(act.Args["path"], "main")
@@ -185,11 +186,15 @@ func (a *Agent) execute(act action, branch string) (result string, prNum int, pr
 		if message == "" {
 			message = "update " + act.Args["path"]
 		}
-		err := a.gh.WriteFile(branch, act.Args["path"], content, message)
+		commitSHA, err := a.gh.WriteFile(branch, act.Args["path"], content, message)
 		if err != nil {
 			return "", 0, "", false, err.Error()
 		}
-		return "wrote " + act.Args["path"], 0, "", false, ""
+		// Сохраняем commit SHA
+		task.Commits = append(task.Commits, commitSHA)
+		commitURL := fmt.Sprintf("https://github.com/%s/%s/commit/%s", task.Owner, task.Repo, commitSHA)
+		log.Printf("Commit created: %s", commitURL)
+		return fmt.Sprintf("wrote %s (commit: %s)", act.Args["path"], commitSHA[:7]), 0, "", false, ""
 
 	case "list_files":
 		files, err := a.gh.ListDir(act.Args["path"], "main")
@@ -209,10 +214,18 @@ func (a *Agent) execute(act action, branch string) (result string, prNum int, pr
 		title := act.Args["title"]
 		body := act.Args["body"]
 
-		// Если включен прямой коммит - просто завершаемся
+		// Если включен прямой коммит - возвращаем ссылки на коммиты
 		if a.cfg.DirectCommit {
-			summary := fmt.Sprintf("Изменения закоммичены в main\n%s\n\n%s", title, body)
-			return summary, 0, "", true, ""
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("✅ Изменения закоммичены в main\n\n%s\n\n", title))
+			if len(task.Commits) > 0 {
+				sb.WriteString("🔗 Коммиты:\n")
+				for _, sha := range task.Commits {
+					commitURL := fmt.Sprintf("https://github.com/%s/%s/commit/%s", task.Owner, task.Repo, sha)
+					sb.WriteString(fmt.Sprintf("• %s\n", commitURL))
+				}
+			}
+			return sb.String(), 0, "", true, ""
 		}
 
 		// Запрашиваем подтверждение через бота
