@@ -674,6 +674,8 @@ func (b *Bot) helpText() string {
 — вопрос → чат с AI
 — "покажи PR для owner/repo" → список PR любого репо
 
+мой логин (repo) в Github - gammanik, твой репо - gammanik/claude-tg
+
 *Команды:*
 `+"`/repo owner/name`"+` — переключить репозиторий
 `+"`/repos [username]`"+` — список репозиториев пользователя
