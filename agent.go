@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -67,13 +68,21 @@ func (a *Agent) Run(task *Task) {
 		}
 	}()
 
-	// Создаём ветку
-	branch := makeBranch(task.Description, task.ID)
-	task.Steps <- Step{Type: StepThought, Content: "Создаю ветку " + branch}
+	// Определяем ветку для работы
+	var branch string
+	if a.cfg.DirectCommit {
+		// Прямой коммит в main
+		branch = "main"
+		task.Steps <- Step{Type: StepThought, Content: "Работаю с main (прямой коммит)"}
+	} else {
+		// Создаём feature-ветку
+		branch = makeBranch(task.Description, task.ID)
+		task.Steps <- Step{Type: StepThought, Content: "Создаю ветку " + branch}
 
-	if err := a.gh.CreateBranch(branch); err != nil {
-		task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
-		return
+		if err := a.gh.CreateBranch(branch); err != nil {
+			task.Steps <- Step{Type: StepError, Content: "CreateBranch: " + err.Error()}
+			return
+		}
 	}
 	task.Branch = branch
 
@@ -88,11 +97,14 @@ func (a *Agent) Run(task *Task) {
 	}
 
 	for i := 0; i < 25; i++ {
+		log.Printf("[Agent] Iteration %d/%d", i+1, 25)
 		resp, err := a.llm.Call(TierOpus, messages[0].Content, messages[len(messages)-1].Content)
 		if err != nil {
+			log.Printf("[Agent] LLM error: %v", err)
 			task.Steps <- Step{Type: StepError, Content: "LLM: " + err.Error()}
 			return
 		}
+		log.Printf("[Agent] LLM response length: %d chars", len(resp))
 		messages = append(messages, msg{Role: "assistant", Content: resp})
 
 		// Извлекаем мысль
@@ -102,12 +114,15 @@ func (a *Agent) Run(task *Task) {
 
 		// Парсим actions
 		actions := parseActions(resp)
+		log.Printf("[Agent] Parsed %d actions", len(actions))
 		if len(actions) == 0 {
+			log.Printf("[Agent] No actions found, marking as done")
 			task.Steps <- Step{Type: StepDone, Content: resp}
 			return
 		}
 
 		// Выполняем actions
+		log.Printf("[Agent] Executing %d actions...", len(actions))
 		results, prNum, prURL, done := a.executeActions(actions, branch, task)
 
 		if prNum > 0 {
@@ -193,6 +208,12 @@ func (a *Agent) execute(act action, branch string) (result string, prNum int, pr
 	case "create_pr":
 		title := act.Args["title"]
 		body := act.Args["body"]
+
+		// Если включен прямой коммит - просто завершаемся
+		if a.cfg.DirectCommit {
+			summary := fmt.Sprintf("Изменения закоммичены в main\n%s\n\n%s", title, body)
+			return summary, 0, "", true, ""
+		}
 
 		// Запрашиваем подтверждение через бота
 		if a.bot != nil {

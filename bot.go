@@ -162,6 +162,14 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message, threadID int) {
 	case strings.HasPrefix(text, "/repo "):
 		b.setRepo(strings.TrimPrefix(text, "/repo "), threadID)
 		return
+	case strings.HasPrefix(text, "/repos "):
+		username := strings.TrimSpace(strings.TrimPrefix(text, "/repos "))
+		b.listRepos(username, threadID)
+		return
+	case text == "/repos":
+		o, _ := b.currentRepo()
+		b.listRepos(o, threadID)
+		return
 	}
 
 	// Автоопределение намерения
@@ -472,6 +480,16 @@ func (b *Bot) mergePR(prNum int, threadID int) {
 	b.tg(fmt.Sprintf("✅ PR #%d смержен", prNum), threadID)
 }
 
+func (b *Bot) listRepos(username string, threadID int) {
+	gh := NewGitHubClient(b.cfg.GitHubToken, "", "")
+	result, err := gh.GetUserRepos(username)
+	if err != nil {
+		b.tg("❌ "+err.Error(), threadID)
+		return
+	}
+	b.tg(result, threadID)
+}
+
 func (b *Bot) closePR(prNum int, threadID int) {
 	o, r := b.currentRepo()
 	gh := NewGitHubClient(b.cfg.GitHubToken, o, r)
@@ -599,6 +617,7 @@ func (b *Bot) helpText() string {
 
 *Команды:*
 `+"`/repo owner/name`"+` — переключить репозиторий
+`+"`/repos [username]`"+` — список репозиториев пользователя
 `+"`/prs`"+` — показать PR
 `+"`/status`"+` — текущий статус
 

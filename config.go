@@ -10,6 +10,7 @@ type Config struct {
 	GitHubToken  string
 	DefaultOwner string
 	DefaultRepo  string
+	DirectCommit bool // Коммитить в main напрямую без PR
 
 	// LLM Provider (anthropic | deepseek)
 	LLMProvider  string
