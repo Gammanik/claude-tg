@@ -30,13 +30,16 @@ type Bot struct {
 	tasks       map[string]*Task
 	remindersMu sync.Mutex
 	reminders   []Reminder
+	approvalsMu sync.Mutex
+	approvals   map[string]chan bool // taskID → ответ пользователя
 }
 
 func NewBot(cfg Config) *Bot {
 	id, _ := strconv.ParseInt(cfg.AllowedChatID, 10, 64)
 	b := &Bot{cfg: cfg, chatID: id,
 		owner: cfg.DefaultOwner, repo: cfg.DefaultRepo,
-		tasks: make(map[string]*Task),
+		tasks:     make(map[string]*Task),
+		approvals: make(map[string]chan bool),
 	}
 	b.topics = NewTopicManager(cfg.TelegramToken, id)
 	return b
@@ -286,13 +289,27 @@ func (b *Bot) runCodingTask(description string, _ int) {
 	go b.drainSteps(task, pt, taskThreadID)
 }
 
-// drainSteps читает шаги агента (для передачи в watchCI и финального сообщения)
+// drainSteps читает шаги агента и стримит мысли агента в Telegram
 func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 	var prNum int
 	var prURL string
+	var thoughtMsgID int // единое сообщение для стриминга мыслей агента
 
 	for step := range task.Steps {
 		switch step.Type {
+		case StepThought:
+			text := "💭 _" + truncate(step.Content, 300) + "_"
+			if thoughtMsgID == 0 {
+				thoughtMsgID = b.tg(text, threadID)
+			} else {
+				b.edit(thoughtMsgID, text)
+			}
+
+		case StepAction:
+			if thoughtMsgID != 0 {
+				b.edit(thoughtMsgID, "⚙️ _"+truncate(step.Content, 300)+"_")
+			}
+
 		case StepPR:
 			prNum = step.PRNumber
 			prURL = step.PRURL
@@ -305,11 +322,9 @@ func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 
 		case StepDone:
 			pt.Finish()
-			// Отправляем итог + календарь
 			b.sendTaskResult(task, step.Content, prNum, prURL, threadID)
 			b.removeTask(task.ID)
 		}
-		// Thought и Action уже обрабатываются в ProgressTracker
 	}
 }
 
@@ -326,13 +341,19 @@ func (b *Bot) watchCI(task *Task, prNum int, prURL string, pt *ProgressTracker, 
 		if pt != nil {
 			pt.DoneStep(false)
 		}
+		mergeText := fmt.Sprintf("✅ Тесты прошли\n[PR #%d](%s)\n\nМержить?", prNum, prURL)
+		if !b.requestApproval(task.ID+"-merge", mergeText, threadID) {
+			b.tg(fmt.Sprintf("⏸ Мерж отложен → [PR #%d](%s)", prNum, prURL), threadID)
+			b.removeTask(task.ID)
+			return
+		}
 		if err := gh.MergePR(prNum); err != nil {
-			b.tg(fmt.Sprintf("⚠️ Тесты ✅ мерж ❌: %v\n🔗 %s", err, prURL), threadID)
+			b.tg(fmt.Sprintf("⚠️ Мерж ❌: %v\n🔗 %s", err, prURL), threadID)
 		} else {
 			if pt != nil {
 				pt.Finish()
 			}
-			b.sendTaskResult(task, "PR смержен автоматически", prNum, prURL, threadID)
+			b.sendTaskResult(task, "PR смержен", prNum, prURL, threadID)
 		}
 		b.removeTask(task.ID)
 
@@ -579,11 +600,49 @@ func (b *Bot) cancelTask(id string, threadID int) {
 
 func (b *Bot) handleCallback(q *tgbotapi.CallbackQuery) {
 	b.api.Request(tgbotapi.NewCallback(q.ID, ""))
-	if strings.HasPrefix(q.Data, "close:") {
+	switch {
+	case strings.HasPrefix(q.Data, "approve:"):
+		b.resolveApproval(strings.TrimPrefix(q.Data, "approve:"), true)
+	case strings.HasPrefix(q.Data, "reject:"):
+		b.resolveApproval(strings.TrimPrefix(q.Data, "reject:"), false)
+	case strings.HasPrefix(q.Data, "close:"):
 		n, _ := strconv.Atoi(strings.TrimPrefix(q.Data, "close:"))
 		o, r := b.currentRepo()
 		NewGitHubClient(b.cfg.GitHubToken, o, r).ClosePR(n)
 		b.tg(fmt.Sprintf("🗑 PR #%d закрыт", n), 0)
+	}
+}
+
+// requestApproval отправляет кнопки и блокирует горутину агента до ответа пользователя
+func (b *Bot) requestApproval(taskID, text string, threadID int) bool {
+	ch := make(chan bool, 1)
+	b.approvalsMu.Lock()
+	b.approvals[taskID] = ch
+	b.approvalsMu.Unlock()
+
+	b.sendWithButtons(text, [][]map[string]any{
+		{
+			{"text": "✅ Да", "callback_data": "approve:" + taskID},
+			{"text": "❌ Отмена", "callback_data": "reject:" + taskID},
+		},
+	}, threadID)
+
+	select {
+	case ok := <-ch:
+		return ok
+	case <-time.After(10 * time.Minute):
+		b.resolveApproval(taskID, false)
+		return false
+	}
+}
+
+func (b *Bot) resolveApproval(taskID string, approved bool) {
+	b.approvalsMu.Lock()
+	ch := b.approvals[taskID]
+	delete(b.approvals, taskID)
+	b.approvalsMu.Unlock()
+	if ch != nil {
+		ch <- approved
 	}
 }
 
