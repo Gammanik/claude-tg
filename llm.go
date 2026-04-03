@@ -90,7 +90,7 @@ func (c *LLMClient) selectAnthropicModel(tier ModelTier) string {
 	case TierSonnet:
 		return "claude-3-5-sonnet-20241022"
 	case TierOpus:
-		return "claude-3-opus-20240229"
+		return "claude-3-5-sonnet-20241022" // используем Sonnet вместо Opus (дешевле)
 	default:
 		return "claude-3-5-sonnet-20241022"
 	}
