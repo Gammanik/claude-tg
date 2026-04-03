@@ -37,7 +37,7 @@ func NewLLMClient(anthropicKey, deepseekKey, provider string) *LLMClient {
 
 // Call вызывает модель нужного уровня
 func (c *LLMClient) Call(tier ModelTier, system, user string) (string, error) {
-	if c.provider == "anthropic" {
+	if c.provider == "anthropic" || c.provider == "claude" {
 		return c.callAnthropic(tier, system, user, false)
 	}
 	return c.callDeepSeek(system, user)
@@ -45,7 +45,7 @@ func (c *LLMClient) Call(tier ModelTier, system, user string) (string, error) {
 
 // Stream вызывает модель со стримингом (только для Anthropic Sonnet/Opus)
 func (c *LLMClient) Stream(tier ModelTier, system, user string, onChunk func(string)) (string, error) {
-	if c.provider != "anthropic" {
+	if c.provider != "anthropic" && c.provider != "claude" {
 		// Fallback на обычный вызов для не-Anthropic
 		return c.callDeepSeek(system, user)
 	}
