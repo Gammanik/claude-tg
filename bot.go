@@ -199,6 +199,39 @@ func (b *Bot) route(text string, threadID int) {
 	log.Printf("intent: %s", intent)
 
 	switch {
+	case strings.Contains(intent, "switch_repo"):
+		// Пытаемся извлечь owner/repo из текста
+		if owner, repo, found := extractRepo(text); found {
+			b.repoMu.Lock()
+			b.owner, b.repo = owner, repo
+			b.repoMu.Unlock()
+			b.tg(fmt.Sprintf("✅ Переключено на `%s/%s`", owner, repo), threadID)
+			return
+		}
+		// Если формат owner/repo не найден, пробуем просто имя репо
+		words := strings.Fields(text)
+		for i, word := range words {
+			word = strings.ToLower(word)
+			if (word == "на" || word == "to") && i+1 < len(words) {
+				repoName := strings.TrimSpace(words[i+1])
+				// Удаляем лишние символы
+				repoName = strings.Trim(repoName, ".,!?;:")
+				b.repoMu.Lock()
+				// Если не указан owner, используем текущий
+				if !strings.Contains(repoName, "/") {
+					repoName = b.owner + "/" + repoName
+				}
+				parts := strings.Split(repoName, "/")
+				if len(parts) == 2 {
+					b.owner, b.repo = parts[0], parts[1]
+					b.repoMu.Unlock()
+					b.tg(fmt.Sprintf("✅ Переключено на `%s/%s`", parts[0], parts[1]), threadID)
+					return
+				}
+				b.repoMu.Unlock()
+			}
+		}
+		b.tg("❌ Не могу определить репозиторий. Используй формат: `/repo owner/name` или укажи `owner/repo` в сообщении", threadID)
 	case strings.Contains(intent, "list_prs"):
 		b.listPRs(threadID)
 	case strings.Contains(intent, "list_repos"):

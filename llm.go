@@ -283,6 +283,8 @@ func (c *LLMClient) RouteIntent(text, owner, repo string) (string, error) {
 	system := fmt.Sprintf(`You are a request router for GitHub bot. Repo: %s/%s.
 
 Classify user intent into ONE of:
+- "switch_repo" - switch/change to different repository
+  Examples: "переключись на claude-tg", "switch to myrepo", "работай с owner/repo"
 - "list_prs" - ONLY show pull requests list (no actions)
 - "list_repos" - ONLY list user repositories (no actions)
 - "merge_pr" - ONLY merge specific PR (no other actions)
@@ -291,7 +293,9 @@ Classify user intent into ONE of:
   Examples: "read X and fix Y", "add feature Z", "update config", "read code, commit, push"
 - "chat" - simple questions without any actions
 
-IMPORTANT: If request mentions ANY code work or multiple steps → use "code"
+IMPORTANT:
+- Repository switching (переключись, switch, работай с) → "switch_repo"
+- Code work or multiple steps → "code"
 
 Output ONLY the intent name, nothing else.`, owner, repo)
 
