@@ -32,6 +32,8 @@ type Bot struct {
 	reminders   []Reminder
 	approvalsMu sync.Mutex
 	approvals   map[string]chan bool // taskID → ответ пользователя
+	history     *MessageHistory      // история сообщений для поиска
+	limits      *UsageLimits         // лимиты использования API
 }
 
 func NewBot(cfg Config) *Bot {
@@ -64,6 +66,8 @@ func (b *Bot) Start() error {
 		return err
 	}
 	b.api = api
+	b.history = NewMessageHistory(api, b.chatID)
+	b.limits = NewUsageLimits()
 	log.Printf("✅ @%s online", api.Self.UserName)
 	go b.reminderLoop()
 
@@ -125,6 +129,18 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message, threadID int) {
 	if text == "" {
 		return
 	}
+
+	// Сохраняем в историю для поиска
+	from := "user"
+	if msg.From != nil && msg.From.UserName != "" {
+		from = msg.From.UserName
+	} else if msg.From != nil {
+		from = msg.From.FirstName
+	}
+	if b.history != nil {
+		b.history.AddMessage(msg.MessageID, threadID, from, text)
+	}
+
 	b.route(text, threadID)
 }
 
@@ -308,8 +324,9 @@ func (b *Bot) drainSteps(task *Task, pt *ProgressTracker, threadID int) {
 
 		case StepAction:
 			if thoughtMsgID != 0 {
-				// Визуально отличаем действие от мысли
-				b.edit(thoughtMsgID, "⚡ _"+truncate(step.Content, 300)+"_")
+				// Визуально отличаем действие от мысли - показываем детали вызова
+				actionText := formatToolCall(step.Content)
+				b.edit(thoughtMsgID, actionText)
 			}
 
 		case StepPR:
@@ -688,6 +705,45 @@ func (b *Bot) helpText() string {
 }
 
 type Button struct{ Label, Data string }
+
+// formatToolCall - форматирует вызов тула с иконкой и параметрами
+func formatToolCall(toolCall string) string {
+	// toolCall имеет формат "tool_name(args)"
+	// Например: "read_file(src/App.tsx)" или "search_code(useEffect)"
+
+	icons := map[string]string{
+		"read_file":      "📖",
+		"write_file":     "✏️",
+		"list_files":     "📁",
+		"search_code":    "🔍",
+		"search_history": "🔎",
+		"get_summary":    "📋",
+		"spawn_subagent": "🤖",
+		"orchestrate":    "🎯",
+		"create_pr":      "🚀",
+		"done":           "✅",
+	}
+
+	// Извлекаем имя тула и аргументы
+	parts := strings.SplitN(toolCall, "(", 2)
+	if len(parts) < 2 {
+		return "⚡ _" + truncate(toolCall, 300) + "_"
+	}
+
+	toolName := parts[0]
+	args := strings.TrimSuffix(parts[1], ")")
+
+	icon := icons[toolName]
+	if icon == "" {
+		icon = "⚙️"
+	}
+
+	// Форматируем красиво с параметрами
+	if args != "" {
+		return fmt.Sprintf("%s `%s`\n_→ %s_", icon, toolName, truncate(args, 250))
+	}
+	return fmt.Sprintf("%s `%s`", icon, toolName)
+}
 
 func truncate(s string, max int) string {
 	if len(s) <= max {

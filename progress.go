@@ -35,6 +35,9 @@ type ProgressTracker struct {
 	done_ bool
 
 	stopCh chan struct{}
+
+	// Статистика токенов
+	tokens *TokenStats
 }
 
 type progressStep struct {
@@ -62,6 +65,7 @@ func NewProgressTracker(bot *Bot, taskDesc, owner, repo string, threadID int) *P
 		repo:     repo,
 		started:  time.Now(),
 		stopCh:   make(chan struct{}),
+		tokens:   NewTokenStats(),
 	}
 
 	// Отправляем начальное сообщение
@@ -162,6 +166,15 @@ func (pt *ProgressTracker) render() string {
 		sb.WriteString(fmt.Sprintf("\n🚀 [PR #%d](%s)", pt.prNum, pt.prURL))
 	}
 
+	// Статистика токенов
+	if pt.tokens != nil {
+		_, _, _, _, calls := pt.tokens.GetStats()
+		if calls > 0 {
+			sb.WriteString("\n\n")
+			sb.WriteString(pt.tokens.Format())
+		}
+	}
+
 	if pt.done_ {
 		sb.WriteString(fmt.Sprintf("\n\n✅ *Готово за %s*", fmtDuration(elapsed)))
 	}
@@ -247,6 +260,12 @@ func (pt *ProgressTracker) Error(msg string) {
 	pt.bot.tg("❌ "+msg, pt.threadID)
 }
 
+func (pt *ProgressTracker) AddTokenUsage(input, output, cacheRead, cacheWrite int) {
+	if pt.tokens != nil {
+		pt.tokens.AddUsage(input, output, cacheRead, cacheWrite)
+	}
+}
+
 func (pt *ProgressTracker) estimateRemaining() time.Duration {
 	var est time.Duration
 	for _, p := range pt.pending {
@@ -324,6 +343,8 @@ func getToolIcon(tool string) string {
 		"write_file":     "✏️",
 		"list_files":     "📁",
 		"search_code":    "🔍",
+		"search_history": "🔎",
+		"get_summary":    "📋",
 		"spawn_subagent": "🤖",
 		"orchestrate":    "🎯",
 		"create_pr":      "🚀",

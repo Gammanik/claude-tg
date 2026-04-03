@@ -100,12 +100,39 @@ func (a *Agent) Run(task *Task) {
 	}
 
 	for i := 0; i < 25; i++ {
+		// Проверяем лимиты перед вызовом
+		if a.bot != nil && a.bot.limits != nil {
+			// Оцениваем ожидаемое использование (примерно 1000 токенов на запрос)
+			estimatedTokens := 1000
+			ok, warning := a.bot.limits.CheckLimit(estimatedTokens)
+			if !ok {
+				task.Steps <- Step{Type: StepError, Content: warning}
+				if a.progress != nil {
+					a.progress.Error(warning)
+				}
+				return
+			}
+			if warning != "" {
+				// Показываем предупреждение но продолжаем
+				task.Steps <- Step{Type: StepThought, Content: warning}
+			}
+		}
+
 		resp, err := a.llm(messages)
 		if err != nil {
 			task.Steps <- Step{Type: StepError, Content: "LLM: " + err.Error()}
 			return
 		}
 		messages = append(messages, msg{Role: "assistant", Content: resp})
+
+		// Передаем usage в progress tracker и обновляем лимиты
+		if a.progress != nil {
+			a.progress.AddTokenUsage(lastUsage.Input, lastUsage.Output, lastUsage.CacheRead, lastUsage.CacheWrite)
+		}
+		if a.bot != nil && a.bot.limits != nil {
+			totalTokens := lastUsage.Input + lastUsage.Output
+			a.bot.limits.CheckLimit(totalTokens)
+		}
 
 		if t := extractThought(resp); t != "" {
 			a.think(t, task)
@@ -197,6 +224,48 @@ func (a *Agent) execute(act action, branch string, task *Task) (result string, p
 			return "", 0, "", false, err.Error()
 		}
 		return results, 0, "", false, ""
+
+	case "search_history":
+		if a.bot == nil || a.bot.history == nil {
+			return "", 0, "", false, "История сообщений недоступна"
+		}
+		query := act.Args["query"]
+		threadIDStr := act.Args["thread_id"]
+		limit := 10
+
+		var results []HistoryMessage
+		if threadIDStr != "" {
+			threadID, _ := strconv.Atoi(threadIDStr)
+			results = a.bot.history.SearchInThread(threadID, query, limit)
+		} else {
+			results = a.bot.history.Search(query, limit)
+		}
+
+		return FormatSearchResults(results), 0, "", false, ""
+
+	case "get_summary":
+		if a.bot == nil || a.bot.history == nil {
+			return "", 0, "", false, "История сообщений недоступна"
+		}
+		threadIDStr := act.Args["thread_id"]
+		count := 20
+		if countStr := act.Args["count"]; countStr != "" {
+			if c, err := strconv.Atoi(countStr); err == nil && c > 0 {
+				count = c
+			}
+		}
+
+		var summary string
+		if threadIDStr != "" {
+			threadID, _ := strconv.Atoi(threadIDStr)
+			summary = a.bot.history.GetThreadSummary(threadID, count)
+		} else {
+			// Саммари всех последних сообщений
+			recent := a.bot.history.GetRecentMessages(count)
+			summary = FormatSearchResults(recent)
+		}
+
+		return summary, 0, "", false, ""
 
 	case "spawn_subagent":
 		subTask := &Task{
@@ -336,6 +405,9 @@ func (a *Agent) llm(messages []msg) (string, error) {
 }
 
 func callDeepSeek(key string, messages []msg) (string, error) {
+	if key == "" {
+		return "", fmt.Errorf("❌ DEEPSEEK_API_KEY не найден\n\n👉 Добавь в Railway Variables или .env:\nDEEPSEEK_API_KEY=sk-...\n\nПолучить ключ: platform.deepseek.com")
+	}
 	body, _ := json.Marshal(map[string]any{
 		"model": "deepseek-chat", "max_tokens": 8192, "temperature": 0.1,
 		"messages": messages,
@@ -353,6 +425,9 @@ func callDeepSeek(key string, messages []msg) (string, error) {
 }
 
 func callClaude(key string, messages []msg) (string, error) {
+	if key == "" {
+		return "", fmt.Errorf("❌ ANTHROPIC_API_KEY не найден\n\n👉 Добавь в Railway Variables или .env:\nANTHROPIC_API_KEY=sk-ant-...\n\nПолучить ключ: console.anthropic.com")
+	}
 	var system string
 	var rest []msg
 	for _, m := range messages {
@@ -403,12 +478,26 @@ func parseOpenAI(r io.Reader) (string, error) {
 	return result.Choices[0].Message.Content, nil
 }
 
+// lastUsage - глобальная переменная для хранения последнего usage (временное решение)
+var lastUsage struct {
+	Input      int
+	Output     int
+	CacheRead  int
+	CacheWrite int
+}
+
 func parseAnthropic(r io.Reader) (string, error) {
 	var result struct {
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		Usage *struct {
+			InputTokens          int `json:"input_tokens"`
+			OutputTokens         int `json:"output_tokens"`
+			CacheCreationTokens  int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens int `json:"cache_read_input_tokens"`
+		} `json:"usage"`
 		Error *struct{ Message string } `json:"error"`
 	}
 	if err := json.NewDecoder(r).Decode(&result); err != nil {
@@ -417,6 +506,15 @@ func parseAnthropic(r io.Reader) (string, error) {
 	if result.Error != nil {
 		return "", fmt.Errorf("API: %s", result.Error.Message)
 	}
+
+	// Сохраняем usage для передачи в progress tracker
+	if result.Usage != nil {
+		lastUsage.Input = result.Usage.InputTokens
+		lastUsage.Output = result.Usage.OutputTokens
+		lastUsage.CacheRead = result.Usage.CacheReadInputTokens
+		lastUsage.CacheWrite = result.Usage.CacheCreationTokens
+	}
+
 	for _, c := range result.Content {
 		if c.Type == "text" {
 			return c.Text, nil
@@ -523,6 +621,18 @@ path: "src"
 <action>
 tool: "search_code"
 query: "useUserData"
+</action>
+
+<action>
+tool: "search_history"
+query: "bug fix"
+thread_id: "123"
+</action>
+
+<action>
+tool: "get_summary"
+thread_id: "123"
+count: "20"
 </action>
 
 <action>
