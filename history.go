@@ -146,3 +146,32 @@ func (h *MessageHistory) GetThreadSummary(threadID int, count int) string {
 
 	return sb.String()
 }
+
+// GetLLMMessages - получает последние N сообщений в формате для LLM API
+func (h *MessageHistory) GetLLMMessages(threadID int, count int) []map[string]string {
+	if count <= 0 {
+		count = 10
+	}
+
+	var threadMessages []HistoryMessage
+	for i := len(h.messages) - 1; i >= 0 && len(threadMessages) < count; i-- {
+		msg := h.messages[i]
+		if threadID == 0 || msg.ThreadID == threadID {
+			threadMessages = append([]HistoryMessage{msg}, threadMessages...)
+		}
+	}
+
+	var llmMessages []map[string]string
+	for _, msg := range threadMessages {
+		role := "user"
+		if msg.From == "assistant" || msg.From == "bot" {
+			role = "assistant"
+		}
+		llmMessages = append(llmMessages, map[string]string{
+			"role":    role,
+			"content": msg.Text,
+		})
+	}
+
+	return llmMessages
+}

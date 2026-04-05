@@ -98,7 +98,7 @@ func (a *Agent) Run(task *Task) {
 	}
 
 	for i := 0; i < 25; i++ {
-		log.Printf("[Agent] Iteration %d/%d", i+1, 25)
+		log.Printf("[Agent] === Iteration %d/%d ===", i+1, 25)
 		resp, err := a.llm.Call(TierOpus, messages[0].Content, messages[len(messages)-1].Content)
 		if err != nil {
 			log.Printf("[Agent] LLM error: %v", err)
@@ -106,6 +106,14 @@ func (a *Agent) Run(task *Task) {
 			return
 		}
 		log.Printf("[Agent] LLM response length: %d chars", len(resp))
+
+		// Логируем первые 1000 символов ответа для отладки
+		if len(resp) > 1000 {
+			log.Printf("[Agent] Response preview:\n%s\n...[truncated]", resp[:1000])
+		} else {
+			log.Printf("[Agent] Full response:\n%s", resp)
+		}
+
 		messages = append(messages, msg{Role: "assistant", Content: resp})
 
 		// Извлекаем мысль
@@ -116,7 +124,16 @@ func (a *Agent) Run(task *Task) {
 		// Парсим actions
 		actions := parseActions(resp)
 		log.Printf("[Agent] Parsed %d actions", len(actions))
+
+		// Если не нашли actions, попробуем более мягкий парсинг
 		if len(actions) == 0 {
+			actions = parseActionsRelaxed(resp)
+			log.Printf("[Agent] Relaxed parsing found %d actions", len(actions))
+		}
+
+		if len(actions) == 0 {
+			// Логируем ответ для отладки
+			log.Printf("[Agent] LLM response (first 500 chars): %s", truncate(resp, 500))
 			log.Printf("[Agent] No actions found, marking as done")
 			task.Steps <- Step{Type: StepDone, Content: resp}
 			return
@@ -322,6 +339,54 @@ func parseActions(response string) []action {
 	return actions
 }
 
+// parseActionsRelaxed - более мягкий парсинг для случаев, когда строгий формат не сработал
+func parseActionsRelaxed(response string) []action {
+	var actions []action
+
+	// Пробуем найти блоки между <action> и </action> с более гибкими правилами
+	relaxedActionRe := regexp.MustCompile(`(?is)<action[^>]*>(.*?)</action>`)
+	for _, block := range relaxedActionRe.FindAllStringSubmatch(response, -1) {
+		body := block[1]
+
+		// Ищем tool: "name" или tool:"name" или tool: name
+		relaxedToolRe := regexp.MustCompile(`(?i)tool\s*:\s*["']?(\w+)["']?`)
+		tm := relaxedToolRe.FindStringSubmatch(body)
+		if len(tm) < 2 {
+			continue
+		}
+
+		act := action{Tool: tm[1], Args: make(map[string]string)}
+
+		// Ищем аргументы с более гибкими правилами
+		// Поддерживаем: arg: "value", arg:"value", arg: value (без кавычек)
+		relaxedArgRe := regexp.MustCompile(`(?m)(\w+)\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^\n]+))`)
+		for _, am := range relaxedArgRe.FindAllStringSubmatch(body, -1) {
+			argName := am[1]
+			if argName == "tool" {
+				continue
+			}
+
+			var val string
+			if am[2] != "" {
+				val = am[2] // в двойных кавычках
+			} else if am[3] != "" {
+				val = am[3] // в одинарных кавычках
+			} else if am[4] != "" {
+				val = strings.TrimSpace(am[4]) // без кавычек
+			}
+
+			val = strings.ReplaceAll(val, `\n`, "\n")
+			val = strings.ReplaceAll(val, `\"`, `"`)
+			val = strings.ReplaceAll(val, `\'`, `'`)
+			act.Args[argName] = val
+		}
+
+		actions = append(actions, act)
+	}
+
+	return actions
+}
+
 func extractThought(r string) string {
 	for _, line := range strings.Split(r, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "Thought:") {
@@ -359,6 +424,12 @@ func systemPrompt(owner, repo, ctx string) string {
 ## Project Context
 %s
 
+## IMPORTANT: You MUST use tools to complete tasks
+
+You are an autonomous agent that MUST interact with the repository using tools.
+NEVER just describe what to do - ALWAYS use the tools to actually do it.
+If no tools are needed, use the "done" tool to finish.
+
 ## Available Tools
 
 read_file(path) - read file contents
@@ -368,7 +439,17 @@ search_code(query) - search code in repo
 create_pr(title, body) - create pull request OR finish task (if direct commit mode)
 done(summary) - complete task without PR
 
-## Tool Usage Format
+## Tool Usage Format (STRICT)
+
+You MUST wrap each tool call in <action></action> tags with EXACTLY this format:
+
+<action>
+tool: "tool_name"
+arg1: "value1"
+arg2: "value2"
+</action>
+
+Examples:
 
 <action>
 tool: "read_file"
@@ -382,28 +463,48 @@ content: "package main\n\nfunc Config() {}"
 message: "feat: add config"
 </action>
 
+<action>
+tool: "create_pr"
+title: "feat: add feature X"
+body: "Added feature X to main.go"
+</action>
+
 ## Workflow Rules
 
-1. Always write "Thought:" before actions to explain reasoning
-2. Read files before editing to understand existing code
-3. Multiple write_file actions → multiple commits (commits happen immediately)
-4. After all changes → call create_pr to finish
-5. Keep code style consistent with existing patterns
+1. ALWAYS write "Thought:" before actions to explain reasoning
+2. ALWAYS use tools - never just describe what to do
+3. Read files before editing to understand existing code
+4. Multiple write_file calls create multiple commits (commits happen immediately)
+5. After ALL changes are done, call create_pr OR done to finish
+6. Keep code style consistent with existing patterns
+7. If you don't see tool results, your format was wrong - check the format above
 
-## Example
+## Complete Example
 
-Thought: Need to read the current implementation
-<action>tool: "read_file"
-path: "main.go"</action>
+User: Add a new config function to main.go
 
-Thought: Adding new feature based on existing patterns
-<action>tool: "write_file"
+Thought: First, I need to read the current main.go to understand the structure
+<action>
+tool: "read_file"
 path: "main.go"
-content: "..."
-message: "feat: add feature X"</action>
+</action>
 
-Thought: All changes done, finishing
-<action>tool: "create_pr"
-title: "feat: add feature X"
-body: "Added feature X to main.go"</action>`, owner, repo, ctx)
+[Tool returns file contents]
+
+Thought: Now I'll add the config function, keeping the existing style
+<action>
+tool: "write_file"
+path: "main.go"
+content: "[full updated file content here]"
+message: "feat: add config function"
+</action>
+
+[Tool confirms write]
+
+Thought: All changes done, finishing the task
+<action>
+tool: "create_pr"
+title: "feat: add config function"
+body: "Added config function to main.go"
+</action>`, owner, repo, ctx)
 }

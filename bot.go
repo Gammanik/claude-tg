@@ -333,8 +333,16 @@ func (b *Bot) chat(text string, threadID int) {
 
 	phID := b.tg("💭", threadID)
 
+	// Получаем историю последних 10 сообщений
+	var messages []map[string]string
+	if b.history != nil {
+		messages = b.history.GetLLMMessages(threadID, 10)
+	}
+	// Добавляем текущий запрос
+	messages = append(messages, map[string]string{"role": "user", "content": text})
+
 	// Используем Sonnet со стримингом
-	full, err := b.llm.Stream(TierSonnet, system, text, func(partial string) {
+	full, err := b.llm.StreamWithHistory(TierSonnet, system, messages, func(partial string) {
 		b.edit(phID, partial+" ▌")
 	})
 
@@ -345,6 +353,11 @@ func (b *Bot) chat(text string, threadID int) {
 	}
 
 	b.edit(phID, full)
+
+	// Сохраняем ответ бота в историю
+	if b.history != nil {
+		b.history.AddMessage(phID, threadID, "assistant", full)
+	}
 
 	// Голосовое сообщение для длинных ответов
 	if len(full) > 300 {
@@ -675,6 +688,7 @@ func (b *Bot) helpText() string {
 — "покажи PR для owner/repo" → список PR любого репо
 
 мой логин (repo) в Github - gammanik, твой репо - gammanik/claude-tg
+у тебя есть 
 
 *Команды:*
 `+"`/repo owner/name`"+` — переключить репозиторий

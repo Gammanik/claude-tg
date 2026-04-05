@@ -37,23 +37,33 @@ func NewLLMClient(anthropicKey, deepseekKey, provider string) *LLMClient {
 
 // Call вызывает модель нужного уровня
 func (c *LLMClient) Call(tier ModelTier, system, user string) (string, error) {
+	return c.CallWithHistory(tier, system, []map[string]string{{"role": "user", "content": user}})
+}
+
+// CallWithHistory вызывает модель с полной историей сообщений
+func (c *LLMClient) CallWithHistory(tier ModelTier, system string, messages []map[string]string) (string, error) {
 	if c.provider == "anthropic" || c.provider == "claude" {
-		return c.callAnthropic(tier, system, user, false)
+		return c.callAnthropicWithMessages(tier, system, messages, false)
 	}
-	return c.callDeepSeek(system, user)
+	return c.callDeepSeekWithMessages(system, messages)
 }
 
 // Stream вызывает модель со стримингом (только для Anthropic Sonnet/Opus)
 func (c *LLMClient) Stream(tier ModelTier, system, user string, onChunk func(string)) (string, error) {
-	if c.provider != "anthropic" && c.provider != "claude" {
-		// Fallback на обычный вызов для не-Anthropic
-		return c.callDeepSeek(system, user)
-	}
-	return c.callAnthropic(tier, system, user, true, onChunk)
+	return c.StreamWithHistory(tier, system, []map[string]string{{"role": "user", "content": user}}, onChunk)
 }
 
-// callAnthropic вызывает Anthropic API с выбором модели по tier
-func (c *LLMClient) callAnthropic(tier ModelTier, system, user string, stream bool, callbacks ...func(string)) (string, error) {
+// StreamWithHistory вызывает модель со стримингом и полной историей
+func (c *LLMClient) StreamWithHistory(tier ModelTier, system string, messages []map[string]string, onChunk func(string)) (string, error) {
+	if c.provider != "anthropic" && c.provider != "claude" {
+		// Fallback на обычный вызов для не-Anthropic
+		return c.callDeepSeekWithMessages(system, messages)
+	}
+	return c.callAnthropicWithMessages(tier, system, messages, true, onChunk)
+}
+
+// callAnthropicWithMessages вызывает Anthropic API с выбором модели по tier и полной историей
+func (c *LLMClient) callAnthropicWithMessages(tier ModelTier, system string, messages []map[string]string, stream bool, callbacks ...func(string)) (string, error) {
 	if c.anthropicKey == "" {
 		return "", fmt.Errorf("ANTHROPIC_API_KEY не найден. Получить: https://console.anthropic.com/settings/keys")
 	}
@@ -65,7 +75,7 @@ func (c *LLMClient) callAnthropic(tier ModelTier, system, user string, stream bo
 		"model":      model,
 		"max_tokens": maxTokens,
 		"system":     system,
-		"messages":   []map[string]string{{"role": "user", "content": user}},
+		"messages":   messages,
 	}
 
 	// Добавляем prompt caching для Sonnet/Opus (экономит токены)
@@ -230,18 +240,29 @@ func (c *LLMClient) streamAnthropic(body map[string]any, callbacks ...func(strin
 }
 
 func (c *LLMClient) callDeepSeek(system, user string) (string, error) {
+	messages := []map[string]string{
+		{"role": "system", "content": system},
+		{"role": "user", "content": user},
+	}
+	return c.callDeepSeekWithMessages(system, messages)
+}
+
+func (c *LLMClient) callDeepSeekWithMessages(system string, messages []map[string]string) (string, error) {
 	if c.deepseekKey == "" {
 		return "", fmt.Errorf("DEEPSEEK_API_KEY не найден. Получить: https://platform.deepseek.com")
+	}
+
+	// Добавляем system message если его нет в начале
+	apiMessages := messages
+	if len(messages) == 0 || messages[0]["role"] != "system" {
+		apiMessages = append([]map[string]string{{"role": "system", "content": system}}, messages...)
 	}
 
 	body, _ := json.Marshal(map[string]any{
 		"model":       "deepseek-chat",
 		"max_tokens":  8192,
 		"temperature": 0.1,
-		"messages": []map[string]string{
-			{"role": "system", "content": system},
-			{"role": "user", "content": user},
-		},
+		"messages":    apiMessages,
 	})
 
 	req, _ := http.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewReader(body))
